@@ -291,6 +291,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // Written later: the buffer cache keeps GPU writes over it until then (NoteReportPending).
     const bool report_noted =
         !immediate && impl->rasterizer.NoteReportPending(cpu_addr, report_size);
+    // A fence-flagged counter report stays registered until its fence runs (VideoCore::
+    // KeepFenceReportPending): freeing it here and running it on a skipped fence read the count
+    // before the host GPU had drawn what it covers. Read once: both halves below must agree.
+    const bool keep_pending =
+        is_fence && VideoCore::KeepFenceReportPending(counter_type == QueryType::Payload);
+    const bool is_synced = !keep_pending &&
+                           (Settings::IsGPUFenceBehaviorDefault()
+                                ? !Settings::IsGPULevelHigh()
+                                : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
+                           is_fence;
     // What the operation needs, small enough for MSVC's std::function to hold without allocating:
     // a report per draw (Ocarina of Time's occlusion counts) allocated one each. Host pointers are
     // looked up when it runs.
@@ -304,6 +315,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         bool mirrored;
         bool wide;
         bool noted;
+        bool synced; ///< Freed at once instead of unregistered when it runs.
     };
     const ReportOp report_op{
         .query = query,
@@ -315,6 +327,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         .mirrored = mirrored,
         .wide = has_timestamp,
         .noted = report_noted,
+        .synced = is_synced,
     };
     const auto operation_body = [this, op = report_op] {
         const DAddr op_cpu_addr = op.cpu_addr;
@@ -339,7 +352,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                          trace, asid, op_addr, op_cpu_addr, static_cast<u32>(op_counter_type),
                          static_cast<u32>(query_base->flags));
             }
-            impl->pending_unregister.push_back(op_location);
+            if (!op.synced) [[likely]] {
+                impl->pending_unregister.push_back(op_location);
+            }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
@@ -352,7 +367,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            impl->pending_unregister.push_back(op_location);
+            if (!op.synced) [[likely]] {
+                impl->pending_unregister.push_back(op_location);
+            }
             return;
         }
         query_base->value += op_streamer->GetAmendValue();
@@ -391,13 +408,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                      wide ? 8 : 4, wide ? query_base->value : static_cast<u32>(query_base->value),
                      static_cast<u32>(query_base->flags));
         }
-        impl->pending_unregister.push_back(op_location);
+        if (!op.synced) [[likely]] {
+            impl->pending_unregister.push_back(op_location);
+        }
     };
     static_assert(sizeof(operation_body) <= 48,
                   "the report operation must fit MSVC's std::function storage");
     std::function<void()> operation(operation_body);
     if (is_fence) {
-        VideoCore::g_signaling_query_report_fence = true;
+        // Both halves are needed: keeping the fence alone, with the query freed at once, leaves
+        // a stale operation behind (channels then wait on a semaphore that moved past them).
+        VideoCore::g_signaling_query_report_fence = keep_pending;
         impl->rasterizer.SignalFence(std::move(operation));
         VideoCore::g_signaling_query_report_fence = false;
     } else {
@@ -432,6 +453,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             return;
         }
         impl->rasterizer.SyncOperation(std::move(operation));
+    }
+    if (is_synced) {
+        streamer->Free(new_query_id);
+        return;
     }
     auto [cont_addr, base] = gen_caching_indexing(cpu_addr);
     {
