@@ -613,6 +613,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    // Intel lowers subgroup shuffles at per-lane indices to indirect register accesses; the
+    // software HMMA's uniform broadcast form runs Ocarina's tensor network several times faster.
+    profile.prefer_broadcast_software_hmma = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+                                             driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =

@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vulkan_common/intel_workarounds.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -1611,7 +1612,13 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     auto driver_id = impl->device.GetDriverID();
     const bool is_gpu_high = Settings::IsGPULevelHigh();
 
-    if ((!is_gpu_high && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+    // Skipping the comparison draws everything it would hide (glows and flares behind walls), so
+    // on Intel only skip it where the old integrated-GPU driver workaround still applies.
+    static const bool intel_skip_occlusion = IntelWorkarounds::Enabled(
+        "EDEN_NX2_INTEL_SKIP_OCCLUSION", impl->device.IsIntegrated());
+    const bool intel_bypass = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
+                              intel_skip_occlusion;
+    if ((!is_gpu_high && intel_bypass) || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         EndHostConditionalRendering();
         TraceConditionalRendering("driver-bypass", true, object_1.address, object_2.address);
         return true;
