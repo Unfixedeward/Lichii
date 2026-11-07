@@ -9,7 +9,7 @@ on:
         default: true
   push:
     branches:
-      - nx2-experimental
+      - intel-arc
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -34,6 +34,9 @@ permissions:
 # eglantine.profdata; bump it when a refreshed profile needs a newer LLVM.
 env:
   PGO_LLVM_VERSION: "23"
+  # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
+  # release notes. Update it when the branch moves to a newer upstream build.
+  UPSTREAM_BUILD: "117"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
@@ -47,15 +50,26 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      number: ${{ steps.number.outputs.number }}
     steps:
+      # The fork carries upstream's build-N tags, so its own builds count from 1001 to stay clear
+      # of them. The number is baked into the binaries as build-<number>, and the update checker
+      # compares it against this fork's release tags.
+      - name: Pick the build number
+        id: number
+        shell: bash
+        run: echo "number=$((GITHUB_RUN_NUMBER + 1000))" >> "$GITHUB_OUTPUT"
+
       - name: Prepare release tag
         if: github.event_name == 'push' || inputs.publish_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          LICHII_BUILD_NUMBER: ${{ steps.number.outputs.number }}
         run: |
           set -euo pipefail
-          tag="build-${GITHUB_RUN_NUMBER}"
+          tag="build-${LICHII_BUILD_NUMBER}"
           if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
             if [ "$tag_sha" != "$GITHUB_SHA" ]; then
               echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
@@ -71,6 +85,7 @@ jobs:
     needs: prepare-release
     runs-on: ${{ matrix.runner }}
     env:
+      LICHII_BUILD_NUMBER: ${{ needs.prepare-release.outputs.number }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
       CCACHE_COMPILERCHECK: content
@@ -97,13 +112,7 @@ jobs:
             runner: windows-2022
             pgo: true
             profile: lichii-windows.profdata
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: macos-arm64
-            runner: macos-15
+          # Intel Arc GPUs only exist in x86-64 PCs, so the ARM Linux and macOS builds are left out.
 
     steps:
       - name: Check out source
@@ -273,7 +282,7 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
             -DENABLE_UPDATE_CHECKER=ON
-            -DLICHII_BUILD_TAG=build-${{ github.run_number }}
+            -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }}
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
             -DUSE_DISCORD_PRESENCE=OFF
             -DUSE_CCACHE=ON
@@ -316,7 +325,7 @@ jobs:
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
-            -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
+            -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -346,7 +355,7 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=ON \
-            -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
+            -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON
@@ -423,7 +432,7 @@ jobs:
           export EXTRA_QT_MODULES=waylandcompositor
           export EXTRA_PLATFORM_PLUGINS='libqwayland-egl.so;libqwayland-generic.so'
           # Embedded in the AppImage metadata; matches the release tag (build-N) plus the commit.
-          export LDAI_VERSION="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          export LDAI_VERSION="build-${LICHII_BUILD_NUMBER}-${GITHUB_SHA::7}"
           export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
@@ -607,15 +616,17 @@ jobs:
           retention-days: 7
 
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
+  # intel-arc, and on manual runs unless "Publish the binaries as a GitHub release" is
   # unticked.
   release:
     name: Publish release
-    needs: build
+    needs: [prepare-release, build]
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      LICHII_BUILD_NUMBER: ${{ needs.prepare-release.outputs.number }}
     steps:
       - name: Download binaries
         uses: actions/download-artifact@v7
@@ -654,12 +665,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/build-${GITHUB_RUN_NUMBER}" --jq '.object.sha')
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/build-${LICHII_BUILD_NUMBER}" --jq '.object.sha')
           if [ "$tag_sha" != "$GITHUB_SHA" ]; then
-            echo "Release tag build-${GITHUB_RUN_NUMBER} points to $tag_sha instead of $GITHUB_SHA"
+            echo "Release tag build-${LICHII_BUILD_NUMBER} points to $tag_sha instead of $GITHUB_SHA"
             exit 1
           fi
-          tag="build-${GITHUB_RUN_NUMBER}"
+          tag="build-${LICHII_BUILD_NUMBER}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
           link() { [[ -e "dist/$2" ]] && echo "[$1](${base}/$2)" || true; }
@@ -691,28 +702,27 @@ jobs:
           fi
 
           cat > notes.md <<EOF
-          Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+          Lichii for **Intel Arc** GPUs: upstream [Lichii build ${UPSTREAM_BUILD}](https://github.com/zortos293/Lichii/releases/tag/build-${UPSTREAM_BUILD}) plus the fixes on this fork's [\`intel-arc\`](https://github.com/${GITHUB_REPOSITORY}/tree/intel-arc) branch (commit ${GITHUB_SHA}). Unofficial: report problems with this build [here](https://github.com/${GITHUB_REPOSITORY}/issues), not to upstream.
 
-          ## Linux
+          On Intel Arc it adds: faster software tensor math for Ocarina of Time (on the Frizti fork this took an Arc B580 from about 10 to 30+ fps), no white flashes on leaves and walls at Fast GPU accuracy, shader barriers and occlusion checks kept on discrete Arc cards, and an ASTC texture fix. On other GPUs it behaves like upstream. Details and switches: [INTEL_ARC.md](https://github.com/${GITHUB_REPOSITORY}/blob/intel-arc/INTEL_ARC.md).
 
-          Linux packages come as an AppImage (self-contained, needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch) and a tar.gz (uses your system libraries, so Qt 6 and the usual libraries must be installed).
-
-          $({
-            row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
-          } | table)
+          Suggested settings: GPU Accuracy **Fast**, Async shaders **On**, and in Ocarina's per-game settings, anti-aliasing **No sharpening**. Games, keys and firmware are not included.
 
           ## Windows
 
-          Windows packages are in-place zip files: extract and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
+          Extract the whole zip and run \`lichii.exe\`. It uses the same saves, settings and keys as other Lichii builds. The built-in updater offers new releases of this fork.
 
           $({
             row "amd64 / x86_64" "$(link zip lichii-windows-x86_64.zip)" "$(link "PGO zip" lichii-windows-x86_64-pgo.zip)" "Both built with clang-cl and ThinLTO; the PGO zip adds a profile trained on Ocarina of Time"
           } | table)
 
-          ## macOS
+          ## Linux
 
-          $(row "arm64 (Apple Silicon)" "$(link zip lichii-macos-arm64.zip)" "" "macOS 15 or newer. Not notarized: right-click and choose Open the first time, or run \`xattr -dr com.apple.quarantine lichii.app\`. \`eden-cli\` is inside the app, in \`Contents/MacOS\`" | table)
+          An AppImage (self-contained, needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13, Arch) and a tar.gz (uses your system libraries, so Qt 6 and the usual libraries must be installed).
+
+          $({
+            row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
+          } | table)
 
           ${pgo_note}
           EOF
@@ -721,7 +731,7 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --prerelease \
-            --title "Lichii ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --title "Lichii Intel Arc build ${LICHII_BUILD_NUMBER} (${GITHUB_SHA::7}, upstream build ${UPSTREAM_BUILD})" \
             --notes-file notes.md
 
       # LICHII_BUILD_TAG is baked into every binary as build-<run number>, and the update checker
@@ -733,10 +743,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          expected="build-${GITHUB_RUN_NUMBER}"
+          expected="build-${LICHII_BUILD_NUMBER}"
           published_tag=$(gh release view "$expected" --repo "${GITHUB_REPOSITORY}" --json tagName --jq '.tagName')
           published_title=$(gh release view "$expected" --repo "${GITHUB_REPOSITORY}" --json name --jq '.name')
-          if [ "$published_tag" != "$expected" ] || [[ "$published_title" != *" build ${GITHUB_RUN_NUMBER} ("* ]]; then
-            echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${GITHUB_RUN_NUMBER}"
+          if [ "$published_tag" != "$expected" ] || [[ "$published_title" != *" build ${LICHII_BUILD_NUMBER} ("* ]]; then
+            echo "Release is tagged '$published_tag' and titled '$published_title', expected tag $expected and a title naming build ${LICHII_BUILD_NUMBER}"
             exit 1
           fi
