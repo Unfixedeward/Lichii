@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -17,6 +18,24 @@ namespace Shader::Backend::SPIRV {
 namespace {
 
 constexpr u32 GUEST_WARP_LANES = 32;
+
+// EDEN_NX2_HMMA_BROADCAST=0 keeps the per-lane shuffles everywhere; =1 uses the uniform broadcast
+// reads on any GPU that meets their requirements. Unset: the profile decides (Intel drivers, which
+// lower shuffles at per-lane indices to slow indirect register accesses).
+bool UseBroadcastSoftwareMatrix(const EmitContext& ctx) {
+    static const int forced = [] {
+        const char* const value = std::getenv("EDEN_NX2_HMMA_BROADCAST");
+        if (value == nullptr || *value == '\0') {
+            return -1;
+        }
+        return *value == '0' ? 0 : 1;
+    }();
+    const bool wanted = forced < 0 ? ctx.profile.prefer_broadcast_software_hmma : forced == 1;
+    // Lanes 0..31 are the guest warp only when the subgroup is not wider than 32, and broadcast
+    // and quad broadcast indices that aren't constants need SPIR-V 1.5.
+    return wanted && !ctx.profile.warp_size_potentially_larger_than_guest &&
+           ctx.profile.support_quad_shuffles && ctx.profile.supported_spirv >= 0x00010500;
+}
 constexpr u32 LayoutRowMajor = 0;
 constexpr u32 LayoutColumnMajor = 1;
 // Subgroup scope, acquire-release on workgroup memory.
@@ -273,6 +292,12 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         for (auto& acc : accumulators)
             acc = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, f32ty),
                                  spv::StorageClass::Function);
+        // Function variables come first in the function's first block.
+        const bool broadcast = UseBroadcastSoftwareMatrix(ctx);
+        const Id component_counter =
+            broadcast ? ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, u32ty),
+                                             spv::StorageClass::Function)
+                      : Id{};
         std::array<Id, 8> inputs;
         for (u32 i = 0; i < 4; ++i)
             inputs[i] = ctx.OpCompositeExtract(u32ty, matrix_a, i);
@@ -292,9 +317,72 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
         const Id a_base = add(warp_base, row_base);
         const Id b_base = add(warp_base, col_base);
+        // Broadcast form (UseBroadcastSoftwareMatrix): the component loop counter is the same in
+        // every lane, so every cross-lane read has a uniform source lane. A comes from lane
+        // `component` of the reading lane's quad (a quad broadcast); B from lane (lane & 3) * 8 + k:
+        // broadcasts from lanes k, 8 + k, 16 + k and 24 + k, then a select on lane & 3. The same
+        // values as the shuffles below. The components stay a loop: unrolled, Intel's compiler
+        // spends minutes on the network's kernels.
+        std::array<Id, 4> quad_is{};
+        if (broadcast) {
+            ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+            ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+            const Id quad_lane = and_(lane, 3);
+            for (u32 q = 1; q < 4; ++q) {
+                quad_is[q] = ctx.OpIEqual(ctx.U1, quad_lane, imm(q));
+            }
+        }
+        const auto accumulate = [&](u32 row, const Id as, const std::array<Id, 2>& bs) {
+            for (u32 col = 0; col < 2; ++col) {
+                Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
+                for (u32 half = 0; half < 2; ++half) {
+                    value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
+                                      ctx.OpCompositeExtract(f32ty, bs[col], half), value);
+                    ctx.Decorate(value, spv::Decoration::NoContraction);
+                }
+                ctx.OpStore(accumulators[row * 2 + col], value);
+            }
+        };
+        const auto emit_group_broadcast = [&](auto pick) {
+            ctx.OpStore(component_counter, imm(0));
+            const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
+                     end = ctx.OpLabel();
+            ctx.OpBranch(header);
+            ctx.AddLabel(header);
+            const Id component = ctx.OpLoad(u32ty, component_counter);
+            const Id more = ctx.OpULessThan(ctx.U1, component, imm(4));
+            ctx.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
+            ctx.OpBranchConditional(more, body, end);
+            ctx.AddLabel(body);
+            const Id b = pick(inputs[4], inputs[5]);
+            std::array<Id, 2> bs;
+            for (u32 col = 0; col < 2; ++col) {
+                const Id k = add(component, imm(col * 4));
+                Id value = ctx.OpGroupNonUniformBroadcast(u32ty, imm(3), b, k);
+                for (u32 q = 1; q < 4; ++q) {
+                    const Id read =
+                        ctx.OpGroupNonUniformBroadcast(u32ty, imm(3), b, add(k, imm(q * 8)));
+                    value = ctx.OpSelect(u32ty, quad_is[q], read, value);
+                }
+                bs[col] = unpack(value);
+            }
+            for (u32 row = 0; row < 2; ++row) {
+                const Id as = unpack(ctx.OpGroupNonUniformQuadBroadcast(
+                    u32ty, imm(3), pick(inputs[row], inputs[row + 2]), component));
+                accumulate(row, as, bs);
+            }
+            ctx.OpBranch(next);
+            ctx.AddLabel(next);
+            ctx.OpStore(component_counter, add(component, imm(1)));
+            ctx.OpBranch(header);
+            ctx.AddLabel(end);
+            // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
+            for (const Id accumulator : accumulators)
+                ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
+        };
         // Unrolling a K=8 group lets its shuffles overlap, which latency-bound small dispatches
         // need; unrolling all of K=16 raises register pressure and slows large dispatches.
-        const auto emit_group = [&](auto pick) {
+        const auto emit_group_shuffle = [&](auto pick) {
             for (u32 component = 0; component < 4; ++component) {
                 const Id b = pick(inputs[4], inputs[5]);
                 std::array<Id, 2> bs;
@@ -305,20 +393,19 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
                     const Id as = unpack(ctx.OpGroupNonUniformShuffle(
                         u32ty, imm(3), pick(inputs[row], inputs[row + 2]),
                         add(a_base, imm(component))));
-                    for (u32 col = 0; col < 2; ++col) {
-                        Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
-                        for (u32 half = 0; half < 2; ++half) {
-                            value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
-                                              ctx.OpCompositeExtract(f32ty, bs[col], half), value);
-                            ctx.Decorate(value, spv::Decoration::NoContraction);
-                        }
-                        ctx.OpStore(accumulators[row * 2 + col], value);
-                    }
+                    accumulate(row, as, bs);
                 }
             }
             // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
             for (const Id accumulator : accumulators)
                 ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
+        };
+        const auto emit_group = [&](auto pick) {
+            if (broadcast) {
+                emit_group_broadcast(pick);
+            } else {
+                emit_group_shuffle(pick);
+            }
         };
         if (variant == 0) {
             emit_group([](Id low, Id) { return low; });

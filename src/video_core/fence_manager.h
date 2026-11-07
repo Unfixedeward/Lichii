@@ -81,7 +81,14 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        // A fence that writes a fence-flagged counter report is never skipped as empty: a skipped
+        // fence runs its operation at once, before the host GPU has run the work the report
+        // counts (VideoCore::KeepFenceReportPending).
+        const bool delay_fence = VideoCore::g_signaling_query_report_fence ||
+                                 (Settings::IsGPUFenceBehaviorDefault()
+                                      ? Settings::IsGPULevelHigh()
+                                      : Settings::IsGPUFenceBehaviorBalanced() ||
+                                            Settings::IsGPUFenceBehaviorAccurate());
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }

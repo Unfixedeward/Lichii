@@ -30,6 +30,7 @@
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
 
@@ -282,7 +283,17 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     };
     u8* pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
-    bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+    // A fence-flagged counter report stays registered until its fence runs (VideoCore::
+    // KeepFenceReportPending): freeing it here and running it on a skipped fence read the count
+    // before the host GPU had drawn what it covers. Read once: both halves below must agree.
+    const bool keep_pending =
+        is_fence && VideoCore::KeepFenceReportPending(counter_type == QueryType::Payload);
+    bool is_synced = !keep_pending &&
+                     (Settings::IsGPUFenceBehaviorDefault()
+                          ? !Settings::IsGPULevelHigh()
+                          : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                !Settings::IsGPUFenceBehaviorAccurate()) &&
+                     is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr, addr,
                                      asid = gpu_memory->GetID(), counter_type] {
@@ -339,7 +350,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
     });
     if (is_fence) {
+        // Both halves are needed: keeping the fence alone, with the query freed at once, leaves
+        // a stale operation behind (channels then wait on a semaphore that moved past them).
+        VideoCore::g_signaling_query_report_fence = keep_pending;
         impl->rasterizer.SignalFence(std::move(operation));
+        VideoCore::g_signaling_query_report_fence = false;
     } else {
         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
             if (has_timestamp) {
