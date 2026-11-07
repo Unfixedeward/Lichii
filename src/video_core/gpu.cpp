@@ -34,6 +34,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_fps_log.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -206,6 +207,7 @@ struct GPU::Impl {
                              Settings::values.gpu_clock.GetValue()),
             std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
+        VideoCommon::Nx2FpsLog::Logger::Get().OnFrame();
     }
 
     /// Performs any additional setup necessary in order to begin GPU emulation.
