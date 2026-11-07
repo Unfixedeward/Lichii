@@ -12,6 +12,12 @@
 
 # Lichii
 
+> **Intel Arc fork.** This is upstream Lichii with fixes for Intel Arc GPUs. Downloads are on
+> [this fork's Releases page](https://github.com/Unfixedeward/Lichii/releases), and what's changed
+> is in [INTEL_ARC.md](INTEL_ARC.md). Report problems with these builds
+> [here](https://github.com/Unfixedeward/Lichii/issues), not to upstream. The rest of this README
+> is upstream's.
+
 Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
 
 This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
