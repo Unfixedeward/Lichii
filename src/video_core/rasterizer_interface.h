@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <span>
@@ -53,6 +54,22 @@ using DiskResourceLoadCallback = std::function<void(LoadCallbackStage, std::size
 /// Set while the query cache signals the fence that writes a fence-flagged report, so the fence
 /// manager makes that fence even when it is empty (FenceManager::SignalFence).
 inline thread_local bool g_signaling_query_report_fence = false;
+
+/// Whether a fence-flagged query report stays pending until its fence runs, at every GPU
+/// accuracy. At Fast/Low accuracy with the Default fence behaviour such reports are freed at once
+/// and their fence can be skipped as empty, so a counter report (occlusion samples) ran before
+/// the host GPU had done the work it counts: Ocarina of Time read wrong counts and flashed white
+/// on leaves and walls (upstream PR #337). A semaphore payload is known when it is sent, so by
+/// default it still lands at once: holding it for the fence turns the acquires waiting on it into
+/// drains and GPU waits (about 3 fps in Kokiri Forest on an Arc B580).
+/// EDEN_NX2_FENCE_REPORTS: 0 = never, 1 = counter reports (default), 2 = every report.
+inline bool KeepFenceReportPending(bool is_payload) {
+    static const int mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_FENCE_REPORTS");
+        return value != nullptr && *value != '\0' ? std::atoi(value) : 1;
+    }();
+    return mode >= 2 || (mode == 1 && !is_payload);
+}
 
 class RasterizerInterface {
 public:

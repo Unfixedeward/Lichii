@@ -30,6 +30,7 @@
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/intel_workarounds.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -566,7 +567,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    supports_conditional_barriers =
+        !is_intel_windows ||
+        !IntelWorkarounds::Enabled("EDEN_NX2_INTEL_STRIP_BARRIERS", is_integrated);
+    if (is_intel_windows) {
+        LOG_INFO(Render_Vulkan, "Intel: barriers in shader control flow {}",
+                 supports_conditional_barriers ? "kept" : "removed (driver workaround)");
+    }
 
     CollectPhysicalMemoryInfo();
     CollectToolingInfo();
@@ -696,9 +703,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     if (features.shader_float16_int8.shaderFloat16 && is_intel_windows) {
-        // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time being.
-        LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
-        features.shader_float16_int8.shaderFloat16 = false;
+        if (IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_FP16", false)) {
+            LOG_INFO(Render_Vulkan, "Intel: float16 math enabled (EDEN_NX2_INTEL_FP16)");
+        } else {
+            // Intel's compiler crashes when using fp16 on Astral Chain, disable it for the time
+            // being.
+            LOG_WARNING(Render_Vulkan, "Intel has broken float16 math");
+            features.shader_float16_int8.shaderFloat16 = false;
+        }
     }
 
     has_broken_compute =
@@ -1789,6 +1801,18 @@ void Device::RemoveUnsuitableExtensions() {
         std::vector<VkCooperativeMatrixPropertiesKHR> shapes;
         if (extensions.cooperative_matrix) {
             shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        }
+        // Which shapes the device offers, so a driver without the two the guest's HMMA uses
+        // (16x8x16 or 16x16x16, float16 in and out) can be told apart from one without the
+        // extension.
+        for (const VkCooperativeMatrixPropertiesKHR& shape : shapes) {
+            LOG_INFO(Render_Vulkan,
+                     "Cooperative matrix shape {}x{}x{}: A {} B {} C {} result {}, saturating {}, "
+                     "scope {}",
+                     shape.MSize, shape.NSize, shape.KSize, static_cast<int>(shape.AType),
+                     static_cast<int>(shape.BType), static_cast<int>(shape.CType),
+                     static_cast<int>(shape.ResultType), shape.saturatingAccumulation,
+                     static_cast<int>(shape.scope));
         }
         const auto has_shape = [&](u32 columns) {
             return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {

@@ -107,6 +107,10 @@ struct Profile {
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
+    /// Software HMMA reads its cross-lane values with uniform broadcasts and quad broadcasts
+    /// instead of shuffles at per-lane indices (Intel lowers those to slow indirect register
+    /// accesses). EDEN_NX2_HMMA_BROADCAST=0/1 overrides it.
+    bool prefer_broadcast_software_hmma{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
     bool support_cooperative_hmma{};
     /// Without the above, HMMA runs on 16x16x16 cooperative matrices through shared memory

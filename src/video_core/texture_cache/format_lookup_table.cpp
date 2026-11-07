@@ -39,11 +39,40 @@ constexpr u32 Hash(TextureFormat format, ComponentType component, bool is_srgb =
     return Hash(format, component, component, component, component, is_srgb);
 }
 
+/// ASTC blocks define their own encoding, so the TIC component types mean nothing for them.
+constexpr bool IsAstc(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::ASTC_2D_4X4:
+    case TextureFormat::ASTC_2D_5X5:
+    case TextureFormat::ASTC_2D_6X6:
+    case TextureFormat::ASTC_2D_8X8:
+    case TextureFormat::ASTC_2D_10X10:
+    case TextureFormat::ASTC_2D_12X12:
+    case TextureFormat::ASTC_2D_5X4:
+    case TextureFormat::ASTC_2D_6X5:
+    case TextureFormat::ASTC_2D_8X6:
+    case TextureFormat::ASTC_2D_10X8:
+    case TextureFormat::ASTC_2D_12X10:
+    case TextureFormat::ASTC_2D_8X5:
+    case TextureFormat::ASTC_2D_10X5:
+    case TextureFormat::ASTC_2D_10X6:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // Anonymous namespace
 
 PixelFormat PixelFormatFromTextureInfo(TextureFormat format, ComponentType red, ComponentType green,
                                        ComponentType blue, ComponentType alpha,
                                        bool is_srgb) noexcept {
+    if (IsAstc(format)) {
+        // Some Switch 2 games leave ASTC component types unset or mixed (Ocarina of Time uses
+        // {0 6 2 0} for sRGB ASTC 10x6). Matching them exactly fell through to A8B8G8R8 and
+        // read the compressed blocks as plain pixels.
+        red = green = blue = alpha = UNORM;
+    }
     switch (Hash(format, red, green, blue, alpha, is_srgb)) {
     case Hash(TextureFormat::A8B8G8R8, UNORM):
         return PixelFormat::A8B8G8R8_UNORM;
