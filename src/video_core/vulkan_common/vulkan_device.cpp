@@ -1779,9 +1779,9 @@ void Device::RemoveUnsuitableExtensions() {
                      static_cast<int>(shape.ResultType), shape.saturatingAccumulation,
                      static_cast<int>(shape.scope));
         }
-        const auto has_shape = [&](u32 columns) {
+        const auto has_shape = [&](u32 rows, u32 columns) {
             return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == columns && shape.KSize == 16 &&
+                return shape.MSize == rows && shape.NSize == columns && shape.KSize == 16 &&
                        shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                        shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                        shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
@@ -1813,7 +1813,7 @@ void Device::RemoveUnsuitableExtensions() {
                             extensions.subgroup_size_control &&
                             features.subgroup_size_control.computeFullSubgroups;
         cooperative_hmma_16x8x16 =
-            usable && has_shape(8) &&
+            usable && has_shape(16, 8) &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
             properties.subgroup_properties.subgroupSize == GuestWarpSize &&
             // Compute subgroups may vary between these sizes (always with SPIR-V 1.6), and the
@@ -1821,8 +1821,19 @@ void Device::RemoveUnsuitableExtensions() {
             properties.subgroup_size_control.minSubgroupSize == GuestWarpSize &&
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize;
         cooperative_hmma_16x16x16 =
-            usable && has_shape(16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
-        extensions.cooperative_matrix = cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16;
+            usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        // Intel Xe2 only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so NVIDIA
+        // and AMD keep exactly the paths above (zortos293/Lichii#779). On Intel's Windows driver the
+        // constructor later turns float16 arithmetic off ("Intel has broken float16 math"), but
+        // keeps the device feature for these matrices, as for every cooperative matrix path.
+        // EDEN_NX2_INTEL_XMX=0 leaves HMMA in shader emulation.
+        constexpr u32 intel_vendor_id = 0x8086;
+        cooperative_hmma_8x16x16 =
+            usable && properties.properties.vendorID == intel_vendor_id &&
+            IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_XMX", true) && has_shape(8, 16) &&
+            IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        extensions.cooperative_matrix =
+            cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
