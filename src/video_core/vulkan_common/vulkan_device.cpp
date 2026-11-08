@@ -1546,7 +1546,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
+        // Intel's Windows drivers report driverVersion as (major << 14) | minor (101.9150 is
+        // 0x1964be), which is below VK_MAKE_API_VERSION(27, 20, 100, 0) on every Intel driver, so
+        // the check below turns the extension off on all of them. EDEN_NX2_INTEL_VIDS=1 keeps it.
+        const bool keep_intel_vids = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
+                                     IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_VIDS", false);
+        if (keep_intel_vids) {
+            LOG_INFO(Render_Vulkan,
+                     "Intel: VK_EXT_vertex_input_dynamic_state kept (EDEN_NX2_INTEL_VIDS)");
+        }
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && !keep_intel_vids && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
