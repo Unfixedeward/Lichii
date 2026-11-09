@@ -341,10 +341,17 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     // Transform feedback would capture the scaled values, a passthrough geometry shader doesn't
     // scale the outputs it writes itself, and indexed attribute reads in the fragment stage don't
     // undo the scaling, so all three keep native noperspective interpolation.
+    // The emulation fixes a red line in the Royal Family's Tomb that only AMD's Windows driver
+    // draws, and turned the fog at Hyrule Field's drawbridge solid white elsewhere (Frizti/Fritchii
+    // 9b30eec8c reverted it), so this fork keeps it off unless EDEN_NX2_NOPERSP_AS_SMOOTH=1.
+    static const bool noperspective_as_smooth = [] {
+        const char* const value = std::getenv("EDEN_NX2_NOPERSP_AS_SMOOTH");
+        return value != nullptr && value[0] == '1';
+    }();
     const bool geometry_passthrough{key.unique_hashes[4] != 0 &&
                                     programs[4].is_geometry_passthrough};
-    if (key.unique_hashes[5] != 0 && !geometry_passthrough && key.state.xfb_enabled == 0 &&
-        !programs[5].info.loads_indexed_attributes) {
+    if (noperspective_as_smooth && key.unique_hashes[5] != 0 && !geometry_passthrough &&
+        key.state.xfb_enabled == 0 && !programs[5].info.loads_indexed_attributes) {
         const bool has_tess{key.unique_hashes[3] != 0};
         const bool last_pre_raster{
             (stage == Shader::Stage::VertexB && !has_tess && !has_geometry) ||
