@@ -40,6 +40,7 @@ intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 | Optional native float16 on Intel | Off by default, as upstream. | `EDEN_NX2_INTEL_FP16=1` |
 | ASTC textures with unset component types read correctly | Ocarina's sRGB ASTC 10x6 textures were read as plain pixels. | none |
 | FPS log | The frame rate and the slowest frame every N seconds, in the log. Handy for comparing builds. | `EDEN_NX2_FPS_LOG=10` |
+| GPU wait polling (test) | Waits for the host GPU can poll for a few hundred microseconds before blocking, which avoids the wake-up delay on short waits. Off by default until measured. | `EDEN_NX2_GPU_WAIT_SPIN_US=200`; `EDEN_NX2_GPU_WAIT_STATS=1` logs how long the waits take; `EDEN_NX2_GPU_WAIT_SPIN_AB=1` with the FPS log alternates it off and on |
 | Log of the cooperative matrix shapes your GPU offers | Shows whether the matrix units could run the tensor network natively. | none |
 | Dynamic vertex input on discrete Arc cards | Lichii's old-driver check reads Intel's version numbers wrongly and turned VK_EXT_vertex_input_dynamic_state off on every Intel driver. Discrete Arc cards keep it (integrated GPUs don't). It also lets shader caches made on NVIDIA or AMD match. | `EDEN_NX2_INTEL_VIDS=0` turns it off |
 | Shader caches from another GPU or driver | Upstream build 130 has a new shader cache (v2) whose pipeline keys leave out the driver, so a driver update or a cache made on another PC is used as it is. Older caches are converted on first boot. | none |

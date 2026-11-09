@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
@@ -14,6 +15,10 @@
 /// EDEN_NX2_FPS_LOG=<seconds>: every that many seconds, the game's frame rate and its slowest
 /// frame over the period, in the log. For comparing settings on one machine.
 namespace VideoCommon::Nx2FpsLog {
+
+/// EDEN_NX2_GPU_WAIT_SPIN_AB=1: the logger turns EDEN_NX2_GPU_WAIT_SPIN_US off and on in
+/// alternate periods and says which in each line, to compare the two in one session.
+inline std::atomic<bool> g_spin_phase_on{true};
 
 class Logger {
 public:
@@ -42,9 +47,14 @@ public:
             return;
         }
         const double seconds = std::chrono::duration<double>(now - period_start).count();
-        LOG_INFO(Render, "FPS: {:.1f} over {:.0f} s, slowest frame {:.1f} ms",
+        const bool spin_on = g_spin_phase_on.load(std::memory_order_relaxed);
+        LOG_INFO(Render, "FPS: {:.1f} over {:.0f} s, slowest frame {:.1f} ms{}",
                  static_cast<double>(frames) / seconds, seconds,
-                 std::chrono::duration<double, std::milli>(worst).count());
+                 std::chrono::duration<double, std::milli>(worst).count(),
+                 !spin_ab ? "" : spin_on ? " [GPU wait polling on]" : " [GPU wait polling off]");
+        if (spin_ab) {
+            g_spin_phase_on.store(!spin_on, std::memory_order_relaxed);
+        }
         period_start = now;
         frames = 0;
         worst = {};
@@ -58,7 +68,11 @@ private:
         if (value != nullptr && *value != '\0') {
             period = std::chrono::seconds{std::strtoul(value, nullptr, 10)};
         }
+        const char* const ab = std::getenv("EDEN_NX2_GPU_WAIT_SPIN_AB");
+        spin_ab = period.count() != 0 && ab != nullptr && ab[0] == '1';
     }
+
+    bool spin_ab{};
 
     std::mutex mutex;
     std::chrono::seconds period{};

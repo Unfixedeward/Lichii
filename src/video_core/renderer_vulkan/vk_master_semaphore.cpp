@@ -4,10 +4,16 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <ranges>
+#include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/nx2_fps_log.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -16,6 +22,79 @@
 namespace Vulkan {
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
+
+namespace {
+
+// EDEN_NX2_GPU_WAIT_SPIN_US=<n>: poll the timeline semaphore for up to n microseconds before
+// blocking in vkWaitSemaphores. A blocking wait adds the driver's and the OS's wake-up latency
+// to every short wait, and Switch 2 titles wait for the host GPU hundreds of times a second.
+s64 GpuWaitSpinUs() {
+    static const s64 value = [] {
+        const char* const text = std::getenv("EDEN_NX2_GPU_WAIT_SPIN_US");
+        return text != nullptr ? static_cast<s64>(std::atoll(text)) : s64{0};
+    }();
+    return VideoCommon::Nx2FpsLog::g_spin_phase_on.load(std::memory_order_relaxed) ? value : 0;
+}
+
+// EDEN_NX2_GPU_WAIT_STATS=1: every 10 seconds, how long the waits for the host GPU took.
+class GpuWaitStats {
+public:
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char* const text = std::getenv("EDEN_NX2_GPU_WAIT_STATS");
+            return text != nullptr && text[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void Note(std::chrono::nanoseconds elapsed, bool spun) {
+        const u64 us = static_cast<u64>(elapsed.count() / 1000);
+        const size_t bucket = us < 50 ? 0 : us < 200 ? 1 : us < 1000 ? 2 : us < 5000 ? 3 : 4;
+        buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+        bucket_us[bucket].fetch_add(us, std::memory_order_relaxed);
+        if (spun) {
+            spin_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = last_log_ms.load(std::memory_order_relaxed);
+        if (last == 0) {
+            last_log_ms.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10000 ||
+            !last_log_ms.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+            return;
+        }
+        std::array<u64, 5> count;
+        std::array<u64, 5> total;
+        for (size_t i = 0; i < count.size(); ++i) {
+            count[i] = buckets[i].exchange(0, std::memory_order_relaxed);
+            total[i] = bucket_us[i].exchange(0, std::memory_order_relaxed);
+        }
+        const double seconds = static_cast<double>(now - last) / 1000.0;
+        LOG_INFO(Render_Vulkan,
+                 "GPU waits per second: <50us {:.0f} ({:.1f} ms), <200us {:.0f} ({:.1f} ms), "
+                 "<1ms {:.0f} ({:.1f} ms), <5ms {:.0f} ({:.1f} ms), longer {:.0f} ({:.1f} ms); "
+                 "ended while polling {:.0f}",
+                 count[0] / seconds, total[0] / seconds / 1000.0, count[1] / seconds,
+                 total[1] / seconds / 1000.0, count[2] / seconds, total[2] / seconds / 1000.0,
+                 count[3] / seconds, total[3] / seconds / 1000.0, count[4] / seconds,
+                 total[4] / seconds / 1000.0,
+                 spin_hits.exchange(0, std::memory_order_relaxed) / seconds);
+    }
+
+private:
+    std::array<std::atomic<u64>, 5> buckets{};
+    std::array<std::atomic<u64>, 5> bucket_us{};
+    std::atomic<u64> spin_hits{};
+    std::atomic<s64> last_log_ms{};
+};
+
+GpuWaitStats gpu_wait_stats;
+
+} // Anonymous namespace
 
 MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
     if (!device.HasTimelineSemaphore()) {
@@ -107,16 +186,35 @@ void MasterSemaphore::Wait(u64 tick) {
 
     // If none of the above is hit, fallback to a regular wait
     const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
-    try {
-        while (!semaphore.Wait(tick)) {
-        }
-    } catch (const vk::Exception& exception) {
-        // The throw ends the process; say why first (a device loss reached nothing else here).
-        LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
-        throw;
+    const bool stats = GpuWaitStats::Enabled();
+    const s64 spin_us = GpuWaitSpinUs();
+    const auto start = stats || spin_us > 0 ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+    bool spun = false;
+    if (spin_us > 0) {
+        const auto deadline = start + std::chrono::microseconds{spin_us};
+        do {
+            std::this_thread::yield();
+            Refresh();
+            spun = IsFree(tick);
+        } while (!spun && std::chrono::steady_clock::now() < deadline);
     }
-
-    Refresh();
+    if (!spun) {
+        try {
+            while (!semaphore.Wait(tick)) {
+            }
+        } catch (const vk::Exception& exception) {
+            // The throw ends the process; say why first (a device loss reached nothing else
+            // here).
+            LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick,
+                         exception.what());
+            throw;
+        }
+        Refresh();
+    }
+    if (stats) {
+        gpu_wait_stats.Note(std::chrono::steady_clock::now() - start, spun);
+    }
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
