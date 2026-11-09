@@ -24,6 +24,7 @@
 #include <numeric>
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
+#include "common/shutdown_progress.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/thread.h"
@@ -826,12 +827,17 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // Each step tells a frontend waiting for the emulation thread that the teardown still moves
+    // (Common::ShutdownProgress): with a large cache, writing the driver cache and destroying
+    // tens of thousands of pipelines take longer than its stop timeout.
     serialization_stop.request_stop();
     StopBackgroundJobs();
     // The pipelines' builds end before the driver pipeline cache they build into goes.
     shader_jobs->Shutdown();
     serialization_thread.WaitForRequests();
+    Common::NoteShutdownProgress();
     SaveUsedPipelines();
+    Common::NoteShutdownProgress();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
@@ -840,6 +846,7 @@ PipelineCache::~PipelineCache() {
     shader_cache_v2 = nullptr;
     cache_v2.reset();
     graphics_cache.clear();
+    Common::NoteShutdownProgress();
     evicted_pipelines.clear();
     if (pipeline_binaries) {
         pipeline_binaries->LogCounts("at the end of the session");
@@ -2994,7 +3001,15 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
             cache_data.resize(cache_size);
             pipeline_cache.Read(&cache_size, cache_data.data());
         }
-        file.write(cache_data.data(), cache_size);
+        Common::NoteShutdownProgress();
+        // In pieces: a large cache is gigabytes, and a shutdown waiting on it is told the write
+        // still moves.
+        constexpr size_t Chunk = size_t{64} << 20;
+        for (size_t offset = 0; offset < cache_size; offset += Chunk) {
+            file.write(cache_data.data() + offset,
+                       static_cast<std::streamsize>((std::min)(Chunk, cache_size - offset)));
+            Common::NoteShutdownProgress();
+        }
         file.close();
     } catch (const std::ios_base::failure& e) {
         // The cache stays as it was: only the file being written goes.
