@@ -22,6 +22,7 @@
 #include <numeric>
 #include "common/cityhash.h"
 #include "common/scope_exit.h"
+#include "common/shutdown_progress.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/thread.h"
@@ -778,6 +779,16 @@ constexpr size_t MaxPipelinesWithoutUsedList = 3000;
 // for a later precache.
 constexpr size_t PrecacheCaptureLimit = size_t{1} << 30;
 
+// EDEN_NX2_REKEY_FOREIGN_PIPELINES=0: cached graphics pipelines another GPU driver (or driver
+// version) stored are skipped at boot instead of loaded under this driver (see load_graphics).
+bool RekeyForeignPipelines() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REKEY_FOREIGN_PIPELINES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
     static const bool all = [] {
@@ -789,17 +800,35 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    // Each step tells a frontend waiting for the emulation thread that the teardown still moves
+    // (Common::ShutdownProgress): with a large shared cache, writing the driver cache and
+    // destroying tens of thousands of pipelines take longer than its stop timeout.
     serialization_stop.request_stop();
     background_pipelines.Stop();
+    Common::NoteShutdownProgress();
     workers.WaitForRequests();
     serialization_thread.WaitForRequests();
+    Common::NoteShutdownProgress();
     SaveUsedPipelines();
+    Common::NoteShutdownProgress();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    std::vector<std::unique_ptr<GraphicsPipeline>> pipelines;
+    pipelines.reserve(graphics_cache.size());
+    for (auto& [key, pipeline] : graphics_cache) {
+        pipelines.push_back(std::move(pipeline));
+    }
     graphics_cache.clear();
+    for (size_t index = 0; index < pipelines.size(); ++index) {
+        pipelines[index].reset();
+        if ((index + 1) % 256 == 0) {
+            Common::NoteShutdownProgress();
+        }
+    }
     evicted_pipelines.clear();
+    Common::NoteShutdownProgress();
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1024,6 +1053,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
     size_t queued_graphics = 0;
+    size_t foreign_records = 0;
 
     // With the shader precache this boot, the cached graphics pipelines skipped below are built
     // on the loading screen too, unless an earlier precache built them for this driver.
@@ -1164,6 +1194,27 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             return;
         }
 
+        // The key holds the driver that stored it (eden#4174), so a driver update or a cache
+        // shared by someone on another driver left every record a key no draw makes: built at
+        // boot all the same, never used, while the game translated each pipeline again. Nothing
+        // builds from those two fields, so the record is the same pipeline under this driver; its
+        // used-list age moves to that key. Port of Frizti/Fritchii ececc0bbd.
+        if (key.state.driver_id != dynamic_features.driver_id ||
+            key.state.driver_version != dynamic_features.driver_version) {
+            ++foreign_records;
+            if (!RekeyForeignPipelines()) {
+                return;
+            }
+            const u64 stored_hash = key.Hash();
+            key.state.driver_id = dynamic_features.driver_id;
+            key.state.driver_version = dynamic_features.driver_version;
+            if (const auto used = used_pipelines.find(stored_hash); used != used_pipelines.end()) {
+                const u8 age = used->second;
+                const auto [entry, inserted] = used_pipelines.try_emplace(key.Hash(), age);
+                entry->second = (std::min)(entry->second, age);
+            }
+        }
+
         const u64 hash = key.Hash();
         if (!disk_pipelines.insert(hash).second) {
             return;
@@ -1252,6 +1303,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (foreign_records != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "{} cached graphics pipeline records were stored by another GPU driver{}",
+                 foreign_records,
+                 RekeyForeignPipelines() ? ", loaded under this one" : " and are skipped");
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(
             Render_Vulkan,
@@ -2470,7 +2527,15 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
             cache_data.resize(cache_size);
             pipeline_cache.Read(&cache_size, cache_data.data());
         }
-        file.write(cache_data.data(), cache_size);
+        Common::NoteShutdownProgress();
+        // In pieces: a large cache is gigabytes, and a shutdown waiting on it is told the write
+        // still moves.
+        constexpr size_t Chunk = size_t{64} << 20;
+        for (size_t offset = 0; offset < cache_size; offset += Chunk) {
+            file.write(cache_data.data() + offset,
+                       static_cast<std::streamsize>((std::min)(Chunk, cache_size - offset)));
+            Common::NoteShutdownProgress();
+        }
         file.close();
     } catch (const std::ios_base::failure& e) {
         // The cache stays as it was: only the file being written goes.
