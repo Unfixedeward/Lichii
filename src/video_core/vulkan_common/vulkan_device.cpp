@@ -1561,9 +1561,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
         // Intel's Windows drivers report driverVersion as (major << 14) | minor (101.9150 is
         // 0x1964be), which is below VK_MAKE_API_VERSION(27, 20, 100, 0) on every Intel driver, so
-        // the check below turns the extension off on all of them. EDEN_NX2_INTEL_VIDS=1 keeps it.
-        const bool keep_intel_vids = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
-                                     IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_VIDS", false);
+        // the check below turns the extension off on all of them. Discrete Arc GPUs keep it
+        // (hours of Ocarina on a B580 with it, and shader caches from other GPUs use it); integrated
+        // GPUs keep the old behaviour. EDEN_NX2_INTEL_VIDS=0/1 overrides.
+        const bool keep_intel_vids =
+            driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
+            IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_VIDS",
+                                      properties.properties.deviceType ==
+                                          VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
         if (keep_intel_vids) {
             LOG_INFO(Render_Vulkan,
                      "Intel: VK_EXT_vertex_input_dynamic_state kept (EDEN_NX2_INTEL_VIDS)");

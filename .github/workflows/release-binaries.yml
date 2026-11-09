@@ -36,7 +36,7 @@ env:
   PGO_LLVM_VERSION: "23"
   # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
   # release notes. Update it when the branch moves to a newer upstream build.
-  UPSTREAM_BUILD: "117"
+  UPSTREAM_BUILD: "125"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
