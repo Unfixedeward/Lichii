@@ -24,7 +24,7 @@ GPU job (about 6 ms per frame on a B580). Keep your Intel graphics driver up to 
 
 The first launch of a game builds its shaders, which takes a while. That's normal.
 
-Cutscenes and the title screen: upstream build 125 replaces Ocarina's movie network with a copy
+Cutscenes and the title screen: upstream (since build 125) replaces Ocarina's movie network with a copy
 of its input (#721). That network cost about 33 ms of GPU time a frame even on NVIDIA and held the
 intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 
@@ -42,7 +42,7 @@ intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 | FPS log | The frame rate and the slowest frame every N seconds, in the log. Handy for comparing builds. | `EDEN_NX2_FPS_LOG=10` |
 | Log of the cooperative matrix shapes your GPU offers | Shows whether the matrix units could run the tensor network natively. | none |
 | Dynamic vertex input on discrete Arc cards | Lichii's old-driver check reads Intel's version numbers wrongly and turned VK_EXT_vertex_input_dynamic_state off on every Intel driver. Discrete Arc cards keep it (integrated GPUs don't). It also lets shader caches made on NVIDIA or AMD match. | `EDEN_NX2_INTEL_VIDS=0` turns it off |
-| Shader caches from another GPU or driver are used | Every cached pipeline records the driver that made it, so a driver update or a cache made on another PC was rebuilt from scratch. They now load under your driver (from Fritchii). | `EDEN_NX2_REKEY_FOREIGN_PIPELINES=0` skips them |
+| Shader caches from another GPU or driver | Upstream build 130 has a new shader cache (v2) whose pipeline keys leave out the driver, so a driver update or a cache made on another PC is used as it is. Older caches are converted on first boot. | none |
 | No white fog at Hyrule Field's drawbridge | Upstream #820 emulates "noperspective" varyings for every GPU; it fixes a red line in the Royal Family's Tomb that only AMD's driver draws, and made the drawbridge fog solid white (Fritchii reverted it). Off here. | `EDEN_NX2_NOPERSP_AS_SMOOTH=1` turns it on |
 | Quitting waits for a long shutdown | With a large shader cache, writing it and freeing tens of thousands of pipelines outlasted the stop timeout, and the emulation thread was killed mid-way. It now waits while the shutdown still makes progress (from Fritchii). | none |
 
