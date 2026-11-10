@@ -123,6 +123,9 @@ public:
 
     void LogMemoryStatistics() const;
 
+    /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
+    void LogMemoryTrace();
+
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
 
@@ -479,6 +482,8 @@ public:
 
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
+
+    u32 HostMipLevels() const noexcept;
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
@@ -848,6 +853,7 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;

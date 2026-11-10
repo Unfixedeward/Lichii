@@ -27,12 +27,14 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/intel_workarounds.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/shader_cache_v2/cache.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -429,6 +431,26 @@ u64 AllocatedUsage(VkDeviceSize driver_usage, const VmaBudget& vma_budget) {
     return driver_usage - (std::min)(driver_usage, unused);
 }
 
+// VMA's device memory calls, timed for EDEN_NX2_STUTTER_TRACE.
+PFN_vkAllocateMemory g_vma_allocate_memory{};
+PFN_vkFreeMemory g_vma_free_memory{};
+
+VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
+                                                   const VkMemoryAllocateInfo* allocate_info,
+                                                   const VkAllocationCallbacks* allocator,
+                                                   VkDeviceMemory* memory) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryAllocate};
+    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+}
+
+VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
+                                           const VkAllocationCallbacks* allocator) {
+    using namespace VideoCommon::StutterTrace;
+    const SiteScope site{Site::MemoryFree};
+    g_vma_free_memory(device, memory, allocator);
+}
+
 } // Anonymous namespace
 
 void Device::RemoveExtension(bool& extension, const std::string& extension_name) {
@@ -809,6 +831,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
+    g_vma_allocate_memory = dld.vkAllocateMemory;
+    g_vma_free_memory = dld.vkFreeMemory;
+    functions.vkAllocateMemory = TimedAllocateMemory;
+    functions.vkFreeMemory = TimedFreeMemory;
 
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
@@ -1444,6 +1470,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
         SetNext(next, properties.maintenance5);
     }
+    if (extensions.pipeline_binary) {
+        properties.pipeline_binary.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_PROPERTIES_KHR;
+        SetNext(next, properties.pipeline_binary);
+    }
     if (extensions.custom_border_color) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
@@ -1515,7 +1546,21 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Disable VertexInputDynamicState on old Intel Windows drivers
     if (extensions.vertex_input_dynamic_state) {
         const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
+        // Intel's Windows drivers report driverVersion as (major << 14) | minor (101.9150 is
+        // 0x1964be), which is below VK_MAKE_API_VERSION(27, 20, 100, 0) on every Intel driver, so
+        // the check below turns the extension off on all of them. Discrete Arc GPUs keep it
+        // (hours of Ocarina on a B580 with it, and shader caches from other GPUs use it); integrated
+        // GPUs keep the old behaviour. EDEN_NX2_INTEL_VIDS=0/1 overrides.
+        const bool keep_intel_vids =
+            driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS &&
+            IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_VIDS",
+                                      properties.properties.deviceType ==
+                                          VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+        if (keep_intel_vids) {
+            LOG_INFO(Render_Vulkan,
+                     "Intel: VK_EXT_vertex_input_dynamic_state kept (EDEN_NX2_INTEL_VIDS)");
+        }
+        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && !keep_intel_vids && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
@@ -1752,7 +1797,12 @@ void Device::RemoveUnsuitableExtensions() {
     // The guest's own M=16 N=8 K=16 shape is preferred; without it, a 16x16x16 shape runs HMMA
     // through shared memory with the compute subgroups forced to 32 lanes.
     {
-        const auto shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        // The instance may expose this entry point even when the selected physical device
+        // does not support VK_KHR_cooperative_matrix. Query only eligible devices.
+        std::vector<VkCooperativeMatrixPropertiesKHR> shapes;
+        if (extensions.cooperative_matrix) {
+            shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        }
         // Which shapes the device offers, so a driver without the two the guest's HMMA uses
         // (16x8x16 or 16x16x16, float16 in and out) can be told apart from one without the
         // extension.
@@ -1765,9 +1815,9 @@ void Device::RemoveUnsuitableExtensions() {
                      static_cast<int>(shape.ResultType), shape.saturatingAccumulation,
                      static_cast<int>(shape.scope));
         }
-        const auto has_shape = [&](u32 columns) {
+        const auto has_shape = [&](u32 rows, u32 columns) {
             return std::ranges::any_of(shapes, [=](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == columns && shape.KSize == 16 &&
+                return shape.MSize == rows && shape.NSize == columns && shape.KSize == 16 &&
                        shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                        shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                        shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
@@ -1799,7 +1849,7 @@ void Device::RemoveUnsuitableExtensions() {
                             extensions.subgroup_size_control &&
                             features.subgroup_size_control.computeFullSubgroups;
         cooperative_hmma_16x8x16 =
-            usable && has_shape(8) &&
+            usable && has_shape(16, 8) &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
             properties.subgroup_properties.subgroupSize == GuestWarpSize &&
             // Compute subgroups may vary between these sizes (always with SPIR-V 1.6), and the
@@ -1807,8 +1857,19 @@ void Device::RemoveUnsuitableExtensions() {
             properties.subgroup_size_control.minSubgroupSize == GuestWarpSize &&
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize;
         cooperative_hmma_16x16x16 =
-            usable && has_shape(16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
-        extensions.cooperative_matrix = cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16;
+            usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        // Intel Xe2 only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so NVIDIA
+        // and AMD keep exactly the paths above (zortos293/Lichii#779). On Intel's Windows driver the
+        // constructor later turns float16 arithmetic off ("Intel has broken float16 math"), but
+        // keeps the device feature for these matrices, as for every cooperative matrix path.
+        // EDEN_NX2_INTEL_XMX=0 leaves HMMA in shader emulation.
+        constexpr u32 intel_vendor_id = 0x8086;
+        cooperative_hmma_8x16x16 =
+            usable && properties.properties.vendorID == intel_vendor_id &&
+            IntelWorkarounds::EnvFlag("EDEN_NX2_INTEL_XMX", true) && has_shape(8, 16) &&
+            IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+        extensions.cooperative_matrix =
+            cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
@@ -1844,6 +1905,25 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // VK_KHR_pipeline_binary (needs maintenance5 for the capture flag), kept to drivers without a
+    // disk cache of their own (DriverCachesPipelines) that don't prefer their internal cache: the
+    // store would only duplicate it there (PipelineBinaries). NVIDIA 610.88 also gave ~7.8 MB of
+    // blobs a pipeline: one Ocarina of Time session stored 2.3 GB.
+    if (extensions.pipeline_binary) {
+        LOG_INFO(Render_Vulkan,
+                 "VK_KHR_pipeline_binary: pipelineBinaries {}, internal cache {}, prefers internal "
+                 "cache {}, compressed data {}",
+                 features.pipeline_binary.pipelineBinaries != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryInternalCache != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryPrefersInternalCache != VK_FALSE,
+                 properties.pipeline_binary.pipelineBinaryCompressedData != VK_FALSE);
+    }
+    extensions.pipeline_binary =
+        features.pipeline_binary.pipelineBinaries && extensions.maintenance5 &&
+        !properties.pipeline_binary.pipelineBinaryPrefersInternalCache && !DriverCachesPipelines();
+    RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
+                                       VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;

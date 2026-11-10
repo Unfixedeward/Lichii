@@ -8,6 +8,10 @@ behaves like upstream.
 It's unofficial. Report problems with these builds in this fork's
 [issues](https://github.com/Unfixedeward/Lichii/issues), not to upstream.
 
+On an Arc B580 (driver 101.9150, i7-11700F) with upstream build 130 and these changes, Ocarina's
+intro and title screen run at 60 fps, and Hyrule Field at a median of about 37 fps, 45-52 in
+stretches and 60 in lighter areas. The same PC ran it at about 10 fps before these fixes.
+
 ## Download and install
 
 1. Open the [Releases](https://github.com/Unfixedeward/Lichii/releases) page and take the newest
@@ -24,11 +28,16 @@ GPU job (about 6 ms per frame on a B580). Keep your Intel graphics driver up to 
 
 The first launch of a game builds its shaders, which takes a while. That's normal.
 
+Cutscenes and the title screen: upstream (since build 125) replaces Ocarina's movie network with a copy
+of its input (#721). That network cost about 33 ms of GPU time a frame even on NVIDIA and held the
+intro and cutscenes at 11 fps on a B580 with the audio falling behind.
+
 ## What it changes on Intel
 
 | Change | Why | Switch |
 |---|---|---|
-| Faster software tensor math | Ocarina's sharpening network uses the Switch 2's matrix instructions. Upstream runs them on the GPU's matrix units only with a 16x16x16 float16 shape, and otherwise falls back to software that reads other lanes with per-lane shuffles, which Intel's compiler turns into slow indirect register reads. This fork uses quad and subgroup broadcasts instead. On the Frizti fork this took a B580 from about 10 to 30+ fps. | `EDEN_NX2_HMMA_BROADCAST=0` turns it off |
+| Game's matrix math on the Arc's matrix units (XMX) | Ocarina's sharpening network uses the Switch 2's matrix instructions. Upstream only runs them on matrix units with a 16x8x16 or 16x16x16 shape; Arc (Xe2) offers 8x16x16, so each one now runs as two 8-row products (zortos293/Lichii#779 by Dylan Hachmann, by way of Fritchii). On a B580 under Linux this took the intro from 12 to 60 fps; on Windows (driver 101.9150) the log says "Guest tensor operations run on 8x16x16 cooperative matrices" when it's on. | `EDEN_NX2_INTEL_XMX=0` turns it off |
+| Faster software tensor math (fallback) | When the matrix units can't be used, the software path reads other lanes with quad and subgroup broadcasts instead of per-lane shuffles, which Intel's compiler turns into slow indirect register reads. On the Frizti fork this took a B580 from about 10 to 30+ fps. | `EDEN_NX2_HMMA_BROADCAST=0` turns it off |
 | Counter reports wait for their fence at Fast/Low GPU accuracy | Based on upstream PR #337, limited to occlusion counters. Fixes white flashes on leaves and walls. | `EDEN_NX2_FENCE_REPORTS=0` off, `=2` also semaphore reports |
 | Shader barriers kept on discrete Arc cards | Upstream removes them on every Intel GPU, a workaround for old integrated-GPU drivers. Integrated GPUs keep the workaround. | `EDEN_NX2_INTEL_STRIP_BARRIERS=1` removes them |
 | Occlusion checks resolved on discrete Arc cards | Upstream skips them on Intel at Fast/Low accuracy, which draws glows and flares that should be hidden behind walls. | `EDEN_NX2_INTEL_SKIP_OCCLUSION=1` skips them |
@@ -36,6 +45,10 @@ The first launch of a game builds its shaders, which takes a while. That's norma
 | ASTC textures with unset component types read correctly | Ocarina's sRGB ASTC 10x6 textures were read as plain pixels. | none |
 | FPS log | The frame rate and the slowest frame every N seconds, in the log. Handy for comparing builds. | `EDEN_NX2_FPS_LOG=10` |
 | Log of the cooperative matrix shapes your GPU offers | Shows whether the matrix units could run the tensor network natively. | none |
+| Dynamic vertex input on discrete Arc cards | Lichii's old-driver check reads Intel's version numbers wrongly and turned VK_EXT_vertex_input_dynamic_state off on every Intel driver. Discrete Arc cards keep it (integrated GPUs don't). It also lets shader caches made on NVIDIA or AMD match. | `EDEN_NX2_INTEL_VIDS=0` turns it off |
+| Shader caches from another GPU or driver | Upstream build 130 has a new shader cache (v2) whose pipeline keys leave out the driver, so a driver update or a cache made on another PC is used as it is. Older caches are converted on first boot. | none |
+| No white fog at Hyrule Field's drawbridge | Upstream #820 emulates "noperspective" varyings for every GPU; it fixes a red line in the Royal Family's Tomb that only AMD's driver draws, and made the drawbridge fog solid white (Fritchii reverted it). Off here. | `EDEN_NX2_NOPERSP_AS_SMOOTH=1` turns it on |
+| Quitting waits for a long shutdown | With a large shader cache, writing it and freeing tens of thousands of pipelines outlasted the stop timeout, and the emulation thread was killed mid-way. It now waits while the shutdown still makes progress (from Fritchii). | none |
 
 ### Switches
 
