@@ -86,9 +86,10 @@ private:
     VkExtent2D upscale_extent{};
     std::array<f32, 2> jitter_scale{1.0f, 1.0f};
     std::array<f32, 2> motion_scale{1.0f, 1.0f};
+    bool use_mask{}; ///< EDEN_NX2_XESS_MASK=1: the effects mask as XeSS's responsive mask.
     vk::Image output_image;
     vk::ImageView output_view;
-    vk::Image blank_mask; ///< R16F zeros at the render size, for frames without a mask
+    vk::Image blank_mask; ///< R16F zeros at the render size, for frames without one (use_mask)
     vk::ImageView blank_mask_view;
     std::atomic<bool> failed{};
 };
