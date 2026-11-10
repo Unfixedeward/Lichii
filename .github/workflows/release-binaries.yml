@@ -36,7 +36,7 @@ env:
   PGO_LLVM_VERSION: "23"
   # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
   # release notes. Update it when the branch moves to a newer upstream build.
-  UPSTREAM_BUILD: "130"
+  UPSTREAM_BUILD: "150"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
@@ -472,6 +472,23 @@ jobs:
           }
           windeployqt --release --no-translations build/release/bin/lichii.exe
 
+          # Intel's XeSS runtime for "Use Intel XeSS", pinned to XeSS SDK 3.0.2. Intel's licence
+          # allows passing on the unmodified DLL with Intel's notice, which goes beside it.
+          $xess = 'https://raw.githubusercontent.com/intel/xess/v3.0.2'
+          $files = @(
+            @{ Url = "$xess/bin/libxess.dll"; Out = 'libxess.dll'; Sha = '251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7' },
+            @{ Url = "$xess/LICENSE.txt"; Out = 'LICENSE-XeSS.txt'; Sha = '784be42c39a4a4d03cf85d88e15e59d75828fca773ce45b8dbfffbd7eaf208df' },
+            @{ Url = "$xess/third-party-programs.txt"; Out = 'third-party-programs-XeSS.txt'; Sha = 'e8d8899dbfc4de0e8ca25560be9358e03c1405d7c956d20a1838c3c709b9b51c' }
+          )
+          foreach ($file in $files) {
+            $path = Join-Path build/release/bin $file.Out
+            Invoke-WebRequest -OutFile $path $file.Url
+            $sha = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            if ($sha -ne $file.Sha) {
+              throw "$($file.Out): SHA-256 $sha, expected $($file.Sha)"
+            }
+          }
+
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
       # removed so a machine with Homebrew still uses the bundled copies. Ad-hoc signed, not
@@ -726,9 +743,11 @@ jobs:
           cat > notes.md <<EOF
           Lichii for **Intel Arc** GPUs: upstream [Lichii build ${UPSTREAM_BUILD}](https://github.com/zortos293/Lichii/releases/tag/build-${UPSTREAM_BUILD}) plus the fixes on this fork's [\`intel-arc\`](https://github.com/${GITHUB_REPOSITORY}/tree/intel-arc) branch (commit ${GITHUB_SHA}). Unofficial: report problems with this build [here](https://github.com/${GITHUB_REPOSITORY}/issues), not to upstream.
 
-          On Intel Arc it adds: the game's matrix math on the Arc's matrix units (XMX), with a faster software fallback; no white flashes on leaves and walls at Fast GPU accuracy; shader barriers, occlusion checks and dynamic vertex input kept on discrete Arc cards; no white fog at Hyrule Field's drawbridge; an ASTC texture fix; and quitting no longer kills the emulator mid-shutdown. On an Arc B580 with driver 101.9150, Ocarina's intro and title screen run at 60 fps and Hyrule Field at a median of about 37 fps (45-52 in stretches). On other GPUs it behaves like upstream. Details and switches: [INTEL_ARC.md](https://github.com/${GITHUB_REPOSITORY}/blob/intel-arc/INTEL_ARC.md).
+          On Intel Arc it adds: the game's matrix math on the Arc's matrix units (XMX), with a faster software fallback; no white flashes on leaves and walls at Fast GPU accuracy; shader barriers, occlusion checks and dynamic vertex input kept on discrete Arc cards; no white fog at Hyrule Field's drawbridge; an ASTC texture fix; quitting no longer kills the emulator mid-shutdown; and **Intel XeSS** upscaling for Ocarina of Time (Graphics: turn on "Use AMD FSR 3.1 upscaling in Ocarina of Time", then "Use Intel XeSS in place of FSR 3.1"). The Windows package includes Intel's \`libxess.dll\` for it, under Intel's licence (\`LICENSE-XeSS.txt\`). On an Arc B580 with driver 101.9150 (build 130), Ocarina's intro and title screen run at 60 fps and Hyrule Field at a median of about 37 fps (45-52 in stretches). On other GPUs it behaves like upstream. Details and switches: [INTEL_ARC.md](https://github.com/${GITHUB_REPOSITORY}/blob/intel-arc/INTEL_ARC.md).
 
           Suggested settings: GPU Accuracy **Fast**, Async shaders **On**, and in Ocarina's per-game settings, anti-aliasing **No sharpening**. Games, keys and firmware are not included.
+
+          Since build 150, Lichii keeps its data in \`%APPDATA%\\lichii\` and asks on first launch what to do with the old \`eden\` folder: **Link Old Directory** keeps one shared folder for old and new builds.
 
           ## Windows
 
