@@ -86,6 +86,8 @@ public:
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
         [[nodiscard]] bool WaitsToReach() const;
+        /// Whether it waits for the word to equal `value`.
+        [[nodiscard]] bool WaitsForEqual() const;
     };
 
     [[nodiscard]] bool HasPendingAcquire() const {

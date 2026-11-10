@@ -33,7 +33,7 @@ s64 GpuWaitSpinUs() {
         const char* const text = std::getenv("EDEN_NX2_GPU_WAIT_SPIN_US");
         return text != nullptr ? static_cast<s64>(std::atoll(text)) : s64{0};
     }();
-    return VideoCommon::Nx2FpsLog::g_spin_phase_on.load(std::memory_order_relaxed) ? value : 0;
+    return VideoCommon::Nx2FpsLog::g_ab_phase_on.load(std::memory_order_relaxed) ? value : 0;
 }
 
 // EDEN_NX2_GPU_WAIT_STATS=1: every 10 seconds, how long the waits for the host GPU took.

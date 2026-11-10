@@ -25,6 +25,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_fps_log.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -103,6 +104,14 @@ bool ReleasesLandAtOnce() {
     return !delay_fence && !Settings::IsGPULevelHigh();
 }
 
+bool EqualAcquiresWithoutDrain() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_EQUAL");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled && VideoCommon::Nx2FpsLog::g_ab_phase_on.load(std::memory_order_relaxed);
+}
+
 enum class AcquireCheck {
     Met,         ///< By the word in memory
     MetByQueued, ///< By a release sent to the word that the back has not run yet
@@ -117,7 +126,14 @@ enum class AcquireCheck {
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    // EDEN_NX2_ACQUIRE_EQUAL=1: an equal acquire also passes without a drain, when the last
+    // release the front sent to the word carries its value or, with none queued, the word holds
+    // it. NVN2's queue-sync slots get one release per frame number, so the word changes again
+    // only after the acquiring queue moved on (Frizti/Fritchii's rule; Ocarina drains ~4,700
+    // equal acquires a second, 400 ms of every second of the front thread on an Arc B580). An
+    // equal acquire the word does not meet still drains.
+    const bool equal_without_drain = acquire.WaitsForEqual() && EqualAcquiresWithoutDrain();
+    if (!acquire.WaitsToReach() && !equal_without_drain) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
@@ -138,9 +154,18 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
         VideoCommon::Count(stats.drain_queued);
         return AcquireCheck::Drain;
     }
-    return acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))
-               ? AcquireCheck::Met
-               : AcquireCheck::NotMet;
+    if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+        if (equal_without_drain) {
+            // As Fritchii does: what the front reads after it waits for the work sent before.
+            split.NoteSync();
+        }
+        return AcquireCheck::Met;
+    }
+    if (equal_without_drain) {
+        VideoCommon::Count(stats.drain_operation);
+        return AcquireCheck::Drain;
+    }
+    return AcquireCheck::NotMet;
 }
 
 // EDEN_NX2_ACQUIRE_VERIFY=1: drains anyway and counts where the word after the drain disagrees
@@ -193,6 +218,10 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::PendingAcquire::WaitsToReach() const {
     return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireGequal;
+}
+
+bool Puller::PendingAcquire::WaitsForEqual() const {
+    return static_cast<GpuSemaphoreOperation>(operation) == GpuSemaphoreOperation::AcquireEqual;
 }
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
