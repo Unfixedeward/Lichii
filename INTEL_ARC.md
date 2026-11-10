@@ -8,6 +8,10 @@ behaves like upstream.
 It's unofficial. Report problems with these builds in this fork's
 [issues](https://github.com/Unfixedeward/Lichii/issues), not to upstream.
 
+On an Arc B580 (driver 101.9150, i7-11700F) with upstream build 130 and these changes, Ocarina's
+intro and title screen run at 60 fps, and Hyrule Field at a median of about 37 fps, 45-52 in
+stretches and 60 in lighter areas. The same PC ran it at about 10 fps before these fixes.
+
 ## Download and install
 
 1. Open the [Releases](https://github.com/Unfixedeward/Lichii/releases) page and take the newest
@@ -32,7 +36,7 @@ intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 
 | Change | Why | Switch |
 |---|---|---|
-| Game's matrix math on the Arc's matrix units (XMX) | Ocarina's sharpening network uses the Switch 2's matrix instructions. Upstream only runs them on matrix units with a 16x8x16 or 16x16x16 shape; Arc (Xe2) offers 8x16x16, so each one now runs as two 8-row products (zortos293/Lichii#779 by Dylan Hachmann, by way of Fritchii). On a B580 under Linux this took the intro from 12 to 60 fps. | `EDEN_NX2_INTEL_XMX=0` turns it off |
+| Game's matrix math on the Arc's matrix units (XMX) | Ocarina's sharpening network uses the Switch 2's matrix instructions. Upstream only runs them on matrix units with a 16x8x16 or 16x16x16 shape; Arc (Xe2) offers 8x16x16, so each one now runs as two 8-row products (zortos293/Lichii#779 by Dylan Hachmann, by way of Fritchii). On a B580 under Linux this took the intro from 12 to 60 fps; on Windows (driver 101.9150) the log says "Guest tensor operations run on 8x16x16 cooperative matrices" when it's on. | `EDEN_NX2_INTEL_XMX=0` turns it off |
 | Faster software tensor math (fallback) | When the matrix units can't be used, the software path reads other lanes with quad and subgroup broadcasts instead of per-lane shuffles, which Intel's compiler turns into slow indirect register reads. On the Frizti fork this took a B580 from about 10 to 30+ fps. | `EDEN_NX2_HMMA_BROADCAST=0` turns it off |
 | Counter reports wait for their fence at Fast/Low GPU accuracy | Based on upstream PR #337, limited to occlusion counters. Fixes white flashes on leaves and walls. | `EDEN_NX2_FENCE_REPORTS=0` off, `=2` also semaphore reports |
 | Shader barriers kept on discrete Arc cards | Upstream removes them on every Intel GPU, a workaround for old integrated-GPU drivers. Integrated GPUs keep the workaround. | `EDEN_NX2_INTEL_STRIP_BARRIERS=1` removes them |

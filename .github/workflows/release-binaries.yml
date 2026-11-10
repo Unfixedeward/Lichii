@@ -726,7 +726,7 @@ jobs:
           cat > notes.md <<EOF
           Lichii for **Intel Arc** GPUs: upstream [Lichii build ${UPSTREAM_BUILD}](https://github.com/zortos293/Lichii/releases/tag/build-${UPSTREAM_BUILD}) plus the fixes on this fork's [\`intel-arc\`](https://github.com/${GITHUB_REPOSITORY}/tree/intel-arc) branch (commit ${GITHUB_SHA}). Unofficial: report problems with this build [here](https://github.com/${GITHUB_REPOSITORY}/issues), not to upstream.
 
-          On Intel Arc it adds: faster software tensor math for Ocarina of Time (on the Frizti fork this took an Arc B580 from about 10 to 30+ fps), no white flashes on leaves and walls at Fast GPU accuracy, shader barriers and occlusion checks kept on discrete Arc cards, and an ASTC texture fix. On other GPUs it behaves like upstream. Details and switches: [INTEL_ARC.md](https://github.com/${GITHUB_REPOSITORY}/blob/intel-arc/INTEL_ARC.md).
+          On Intel Arc it adds: the game's matrix math on the Arc's matrix units (XMX), with a faster software fallback; no white flashes on leaves and walls at Fast GPU accuracy; shader barriers, occlusion checks and dynamic vertex input kept on discrete Arc cards; no white fog at Hyrule Field's drawbridge; an ASTC texture fix; and quitting no longer kills the emulator mid-shutdown. On an Arc B580 with driver 101.9150, Ocarina's intro and title screen run at 60 fps and Hyrule Field at a median of about 37 fps (45-52 in stretches). On other GPUs it behaves like upstream. Details and switches: [INTEL_ARC.md](https://github.com/${GITHUB_REPOSITORY}/blob/intel-arc/INTEL_ARC.md).
 
           Suggested settings: GPU Accuracy **Fast**, Async shaders **On**, and in Ocarina's per-game settings, anti-aliasing **No sharpening**. Games, keys and firmware are not included.
 
