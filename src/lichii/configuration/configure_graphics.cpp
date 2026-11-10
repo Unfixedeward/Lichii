@@ -251,6 +251,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             continue;
         }
 #endif
+#ifndef _WIN32
+        // Intel's XeSS runtime is Windows-only.
+        if (setting->Id() == Settings::values.intel_xess.Id()) {
+            continue;
+        }
+#endif
 
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.hdr_reference_white.Id() ||
