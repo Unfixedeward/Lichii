@@ -123,6 +123,13 @@ XessUpscaler::XessUpscaler(const Device& device_, Scheduler& scheduler_,
     if (api == nullptr) {
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
+    // Off by default, as Intel advises unless it clearly helps: XeSS drops its history wherever
+    // the mask is set, and the effects mask made for FSR covers glows and particles widely.
+    const char* const mask = std::getenv("EDEN_NX2_XESS_MASK");
+    use_mask = mask != nullptr && std::strcmp(mask, "1") == 0;
+    if (use_mask) {
+        LOG_INFO(Render_Vulkan, "Intel XeSS: the effects mask is XeSS's responsive mask");
+    }
     if (jitter_scale != std::array{1.0f, 1.0f} || motion_scale != std::array{1.0f, 1.0f}) {
         LOG_INFO(Render_Vulkan, "Intel XeSS: jitter scale ({}, {}), motion scale ({}, {})",
                  jitter_scale[0], jitter_scale[1], motion_scale[0], motion_scale[1]);
@@ -199,7 +206,8 @@ bool XessUpscaler::InitializeOnWorker(VkExtent2D render_size, VkExtent2D upscale
     const xess_vk_init_params_t params{
         .outputResolution = output,
         .qualitySetting = chosen->setting,
-        .initFlags = XESS_INIT_FLAG_LDR_INPUT_COLOR | XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK,
+        .initFlags = static_cast<u32>(XESS_INIT_FLAG_LDR_INPUT_COLOR) |
+                     (use_mask ? static_cast<u32>(XESS_INIT_FLAG_RESPONSIVE_PIXEL_MASK) : 0U),
         .creationNodeMask = 0,
         .visibleNodeMask = 0,
         .tempBufferHeap = VK_NULL_HANDLE,
@@ -320,7 +328,7 @@ bool XessUpscaler::Upscale(const Inputs& in) {
     if (failed.load()) {
         return false;
     }
-    const bool new_render = !blank_mask || in.render_size.width != render_extent.width ||
+    const bool new_render = in.render_size.width != render_extent.width ||
                             in.render_size.height != render_extent.height;
     const bool new_upscale = !output_image || in.upscale_size.width != upscale_extent.width ||
                              in.upscale_size.height != upscale_extent.height;
@@ -332,7 +340,7 @@ bool XessUpscaler::Upscale(const Inputs& in) {
         if (new_upscale) {
             CreateOutput(in.upscale_size);
         }
-        if (new_render) {
+        if (new_render && use_mask) {
             CreateBlankMask(in.render_size);
         }
         render_extent = in.render_size;
@@ -345,13 +353,17 @@ bool XessUpscaler::Upscale(const Inputs& in) {
 
     const Image output{*output_image, *output_view, OUTPUT_FORMAT, COLOR_RANGE,
                        VK_IMAGE_ASPECT_COLOR_BIT};
-    const Image mask = in.responsive.value_or(
-        Image{*blank_mask, *blank_mask_view, MASK_FORMAT, COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT});
+    const std::optional<Image> responsive = use_mask ? in.responsive : std::nullopt;
     xess_vk_execute_params_t params{};
     params.colorTexture = ViewInfo(in.color, in.render_size);
     params.velocityTexture = ViewInfo(in.motion_vectors, in.render_size);
     params.depthTexture = ViewInfo(in.depth, in.render_size);
-    params.responsivePixelMaskTexture = ViewInfo(mask, in.render_size);
+    if (use_mask) {
+        params.responsivePixelMaskTexture = ViewInfo(
+            responsive.value_or(Image{*blank_mask, *blank_mask_view, MASK_FORMAT, COLOR_RANGE,
+                                      VK_IMAGE_ASPECT_COLOR_BIT}),
+            in.render_size);
+    }
     params.outputTexture = ViewInfo(output, in.upscale_size);
     params.jitterOffsetX = in.jitter[0];
     params.jitterOffsetY = in.jitter[1];
@@ -361,7 +373,7 @@ bool XessUpscaler::Upscale(const Inputs& in) {
     params.inputHeight = in.render_size.height;
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, params](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([this, in, responsive, params](vk::CommandBuffer cmdbuf) {
         constexpr VkAccessFlags WRITES =
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
             VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -377,8 +389,8 @@ bool XessUpscaler::Upscale(const Inputs& in) {
                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
         };
-        if (in.responsive) {
-            to_read.push_back(Barrier(*in.responsive, WRITES, VK_ACCESS_SHADER_READ_BIT,
+        if (responsive) {
+            to_read.push_back(Barrier(*responsive, WRITES, VK_ACCESS_SHADER_READ_BIT,
                                       VK_IMAGE_LAYOUT_GENERAL,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
         }
@@ -401,8 +413,8 @@ bool XessUpscaler::Upscale(const Inputs& in) {
             Barrier(params.outputTexture.image, COLOR_RANGE, VK_ACCESS_SHADER_WRITE_BIT,
                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
         };
-        if (in.responsive) {
-            back.push_back(Barrier(*in.responsive, VK_ACCESS_SHADER_READ_BIT, 0,
+        if (responsive) {
+            back.push_back(Barrier(*responsive, VK_ACCESS_SHADER_READ_BIT, 0,
                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                    VK_IMAGE_LAYOUT_GENERAL));
         }

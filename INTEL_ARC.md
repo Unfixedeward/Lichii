@@ -79,6 +79,8 @@ used instead.
 
 - XeSS needs Intel's `libxess.dll` next to `lichii.exe`. The Windows release zips include it, with
   Intel's licence in `LICENSE-XeSS.txt`. Only a DLL signed by Intel Corporation is loaded.
+- Lichii's glow and particle mask (made for FSR) isn't given to XeSS, as Intel advises unless it
+  clearly helps: XeSS drops its history wherever it's set. `EDEN_NX2_XESS_MASK=1` gives it anyway.
 - The preset follows Lichii's resolution: XeSS picks the preset whose input range holds the
   render size. The RCAS sharpness slider doesn't apply to XeSS.
 - `EDEN_NX2_XESS_JITTER=flipy` (or `flipx`, `flipxy`) flips the camera jitter for XeSS, and
