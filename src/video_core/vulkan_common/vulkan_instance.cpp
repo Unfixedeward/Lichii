@@ -23,6 +23,9 @@
 #include <string>
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#include <algorithm>
+#include <string_view>
+#include "video_core/vulkan_common/xess_runtime.h"
 
 namespace Vulkan {
 namespace {
@@ -102,6 +105,30 @@ namespace {
         }
     }
 #endif
+    // What Intel's XeSS asks for, when it's turned on and Intel's runtime loads.
+    if (XessRuntime::Wanted()) {
+        if (const XessRuntime::Api* const xess = XessRuntime::Get()) {
+            u32 count = 0;
+            const char* const* names = nullptr;
+            u32 min_version = 0;
+            const xess_result_t result =
+                xess->vk_get_required_instance_extensions(&count, &names, &min_version);
+            if (result != XESS_RESULT_SUCCESS) {
+                LOG_WARNING(Render_Vulkan, "Intel XeSS: instance extensions unknown ({})",
+                            XessRuntime::ResultName(result));
+            }
+            for (u32 i = 0; result == XESS_RESULT_SUCCESS && i < count; ++i) {
+                const std::string_view name = names[i];
+                const bool listed =
+                    std::ranges::any_of(extensions, [&](const char* e) { return name == e; });
+                const bool available = std::ranges::any_of(
+                    properties, [&](const VkExtensionProperties& p) { return name == p.extensionName; });
+                if (!listed && available) {
+                    extensions.push_back(names[i]);
+                }
+            }
+        }
+    }
     return extensions;
 }
 

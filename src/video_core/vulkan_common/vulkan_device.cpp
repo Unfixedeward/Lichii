@@ -9,6 +9,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -33,6 +34,7 @@
 #include "video_core/vulkan_common/intel_workarounds.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/vulkan_common/xess_runtime.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -827,6 +829,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (host_float16_supported || (device_float16 && WantsAmdFsr4(driver_id))) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
+    xess_ready = xess_extensions && EnableXessFeatures();
+    if (xess_extensions && !xess_ready) {
+        for (const std::string& name : xess_added_extensions) {
+            loaded_extensions.erase(name);
+        }
+    }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -1222,6 +1230,270 @@ bool Device::MustEmulateBGR565() const {
     return Settings::values.emulate_bgr565.GetValue();
 }
 
+namespace {
+/// A feature structure's members: VkBool32s after the sType and pNext header.
+std::span<VkBool32> FeatureBools(void* structure, size_t size) {
+    u8* const members = static_cast<u8*>(structure) + sizeof(VkBaseOutStructure);
+    return {reinterpret_cast<VkBool32*>(members),
+            (size - sizeof(VkBaseOutStructure)) / sizeof(VkBool32)};
+}
+} // Anonymous namespace
+
+void Device::AddXessExtensions() {
+    xess_extensions = false;
+    xess_required_extensions.clear();
+    xess_added_extensions.clear();
+    if (!XessRuntime::Wanted()) {
+        return;
+    }
+    const XessRuntime::Api* const xess = XessRuntime::Get();
+    if (xess == nullptr) {
+        return;
+    }
+    const std::string_view model{properties.properties.deviceName};
+    u32 count = 0;
+    const char* const* names = nullptr;
+    const xess_result_t result =
+        xess->vk_get_required_device_extensions(instance, physical, &count, &names);
+    if (result != XESS_RESULT_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Intel XeSS: not available on {} ({}); using FSR", model,
+                    XessRuntime::ResultName(result));
+        return;
+    }
+    std::string list;
+    for (u32 i = 0; i < count; ++i) {
+        if (!supported_extensions.contains(names[i])) {
+            LOG_WARNING(Render_Vulkan, "Intel XeSS: {} lacks {}; using FSR", model, names[i]);
+            return;
+        }
+        list += (list.empty() ? "" : ", ") + std::string{names[i]};
+    }
+    for (u32 i = 0; i < count; ++i) {
+        xess_required_extensions.emplace_back(names[i]);
+        if (loaded_extensions.insert(names[i]).second) {
+            xess_added_extensions.emplace_back(names[i]);
+        }
+    }
+    xess_extensions = true;
+    LOG_INFO(Render_Vulkan, "Intel XeSS device extensions: {}", list.empty() ? "none" : list);
+}
+
+bool Device::EnableXessFeatures() {
+    // A workaround may have unloaded one since.
+    for (const std::string& name : xess_required_extensions) {
+        if (!loaded_extensions.contains(name)) {
+            LOG_WARNING(Render_Vulkan, "Intel XeSS: needs {}, which this driver runs without; "
+                        "using FSR", name);
+            return false;
+        }
+    }
+    const XessRuntime::Api* const xess = XessRuntime::Get();
+    void* requested = nullptr;
+    if (const xess_result_t result =
+            xess->vk_get_required_device_features(instance, physical, &requested);
+        result != XESS_RESULT_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Intel XeSS: device features unknown ({}); using FSR",
+                    XessRuntime::ResultName(result));
+        return false;
+    }
+    // The emulator's structure of a type, when it's in the device's feature chain.
+    const auto chained = [this](VkStructureType type) -> std::pair<void*, size_t> {
+#define CHAINED(prefix, struct_name, macro_name, var_name)                                         \
+    if (features.var_name.sType == type) {                                                         \
+        return {&features.var_name, sizeof(features.var_name)};                                    \
+    }
+        FOR_EACH_VK_FEATURE_1_1(CHAINED)
+        FOR_EACH_VK_FEATURE_1_2(CHAINED)
+        FOR_EACH_VK_FEATURE_1_3(CHAINED)
+        FOR_EACH_VK_FEATURE_EXT(CHAINED)
+#undef CHAINED
+        return {nullptr, 0};
+    };
+    // What the device supports of a feature structure type.
+    const auto supported = [this](VkStructureType type, size_t size) {
+        std::vector<u64> storage((size + sizeof(u64) - 1) / sizeof(u64));
+        auto* const structure = reinterpret_cast<VkBaseOutStructure*>(storage.data());
+        structure->sType = type;
+        if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            physical.GetFeatures2(*reinterpret_cast<VkPhysicalDeviceFeatures2*>(structure));
+        } else {
+            VkPhysicalDeviceFeatures2 query{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                .pNext = structure,
+                .features{},
+            };
+            physical.GetFeatures2(query);
+        }
+        return storage;
+    };
+    const bool has_mutable_descriptor =
+        loaded_extensions.contains(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) ||
+        loaded_extensions.contains(VK_VALVE_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    const bool has_integer_dot_product =
+        instance_version >= VK_API_VERSION_1_3 ||
+        loaded_extensions.contains(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+
+    // A member of the emulator's own structures stays as the emulator set it, so XeSS can't
+    // turn back on what a driver workaround turned off. Device float16 is the exception: the
+    // emulator's shaders go by float16_math, not by the device feature.
+    const auto keeps = [this](const VkBool32* member) {
+        return *member != VK_FALSE || member == &features.shader_float16_int8.shaderFloat16;
+    };
+
+    // Everything is checked before anything changes.
+    std::vector<VkBool32*> enable;
+    std::vector<VkBaseOutStructure*> append;
+    const auto fail = [](std::string_view what) {
+        LOG_WARNING(Render_Vulkan, "Intel XeSS: asks for {}; using FSR", what);
+        return false;
+    };
+    for (auto* in = static_cast<VkBaseOutStructure*>(requested); in != nullptr; in = in->pNext) {
+        const VkStructureType type = in->sType;
+        void* destination = nullptr;
+        size_t size = 0;
+        bool own = false;
+        if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            destination = &features2;
+            size = sizeof(features2);
+        } else if (const auto [ours, our_size] = chained(type); ours != nullptr) {
+            destination = ours;
+            size = our_size;
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT &&
+                   has_mutable_descriptor) {
+            destination = &xess_mutable_descriptor;
+            size = sizeof(xess_mutable_descriptor);
+            own = true;
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES &&
+                   has_integer_dot_product) {
+            destination = &xess_integer_dot_product;
+            size = sizeof(xess_integer_dot_product);
+            own = true;
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) {
+            size = sizeof(VkPhysicalDeviceVulkan11Features);
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            size = sizeof(VkPhysicalDeviceVulkan12Features);
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) {
+            size = sizeof(VkPhysicalDeviceVulkan13Features);
+        } else {
+            return fail(fmt::format("feature structure type {}", static_cast<int>(type)));
+        }
+        // Only what the device has: XeSS promises nothing else, and a structure's padding (after
+        // an odd number of members) never reads as supported.
+        std::vector<u64> available = supported(type, size);
+        std::vector<u64> wanted_storage(available.size());
+        std::memcpy(wanted_storage.data(), in, size);
+        const std::span<VkBool32> wanted = FeatureBools(wanted_storage.data(), size);
+        const std::span<const VkBool32> has = FeatureBools(available.data(), size);
+        for (size_t i = 0; i < wanted.size(); ++i) {
+            wanted[i] = wanted[i] && has[i] ? VK_TRUE : VK_FALSE;
+        }
+        if (destination != nullptr) {
+            const std::span<VkBool32> ours = FeatureBools(destination, size);
+            const bool emulators = !own && destination != &features2;
+            for (size_t i = 0; i < wanted.size(); ++i) {
+                if (!wanted[i]) {
+                    continue;
+                }
+                if (emulators && !keeps(&ours[i])) {
+                    return fail(fmt::format("member {} of type {}, which the emulator turns off",
+                                            i, static_cast<int>(type)));
+                }
+                enable.push_back(&ours[i]);
+            }
+            if (own) {
+                static_cast<VkBaseOutStructure*>(destination)->sType = type;
+                append.push_back(static_cast<VkBaseOutStructure*>(destination));
+            }
+            continue;
+        }
+        // Vulkan 1.x structures can't join the chain beside the emulator's single-feature
+        // structures: map their members onto those, and refuse any member left over.
+        void* const rest = wanted_storage.data();
+        bool unmapped = false;
+        const auto map = [&](VkBool32& member, VkStructureType owner, VkBool32* target) {
+            if (!member) {
+                return;
+            }
+            member = VK_FALSE;
+            if (owner == 0 || !keeps(target)) {
+                unmapped = true;
+                return;
+            }
+            enable.push_back(target);
+        };
+#define MAP(member, var_name, field)                                                               \
+    map(rest_struct.member, features.var_name.sType, &features.var_name.field)
+        if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) {
+            auto& rest_struct = *static_cast<VkPhysicalDeviceVulkan11Features*>(rest);
+            MAP(storageBuffer16BitAccess, bit16_storage, storageBuffer16BitAccess);
+            MAP(uniformAndStorageBuffer16BitAccess, bit16_storage,
+                uniformAndStorageBuffer16BitAccess);
+            MAP(storagePushConstant16, bit16_storage, storagePushConstant16);
+            MAP(storageInputOutput16, bit16_storage, storageInputOutput16);
+            MAP(variablePointersStorageBuffer, variable_pointer, variablePointersStorageBuffer);
+            MAP(variablePointers, variable_pointer, variablePointers);
+            MAP(shaderDrawParameters, shader_draw_parameters, shaderDrawParameters);
+        } else if (type == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            auto& rest_struct = *static_cast<VkPhysicalDeviceVulkan12Features*>(rest);
+            MAP(shaderFloat16, shader_float16_int8, shaderFloat16);
+            MAP(shaderInt8, shader_float16_int8, shaderInt8);
+            MAP(storageBuffer8BitAccess, bit8_storage, storageBuffer8BitAccess);
+            MAP(uniformAndStorageBuffer8BitAccess, bit8_storage,
+                uniformAndStorageBuffer8BitAccess);
+            MAP(storagePushConstant8, bit8_storage, storagePushConstant8);
+            MAP(timelineSemaphore, timeline_semaphore, timelineSemaphore);
+            MAP(hostQueryReset, host_query_reset, hostQueryReset);
+            MAP(vulkanMemoryModel, vulkan_memory_model, vulkanMemoryModel);
+            MAP(vulkanMemoryModelDeviceScope, vulkan_memory_model, vulkanMemoryModelDeviceScope);
+        } else {
+            auto& rest_struct = *static_cast<VkPhysicalDeviceVulkan13Features*>(rest);
+            MAP(synchronization2, synchronization2, synchronization2);
+            MAP(maintenance4, maintenance4, maintenance4);
+            MAP(subgroupSizeControl, subgroup_size_control, subgroupSizeControl);
+            MAP(computeFullSubgroups, subgroup_size_control, computeFullSubgroups);
+            MAP(shaderDemoteToHelperInvocation, shader_demote_to_helper_invocation,
+                shaderDemoteToHelperInvocation);
+            MAP(robustImageAccess, robust_image_access, robustImageAccess);
+            if (rest_struct.shaderIntegerDotProduct && has_integer_dot_product) {
+                rest_struct.shaderIntegerDotProduct = VK_FALSE;
+                enable.push_back(&xess_integer_dot_product.shaderIntegerDotProduct);
+                xess_integer_dot_product.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+                append.push_back(reinterpret_cast<VkBaseOutStructure*>(&xess_integer_dot_product));
+            }
+        }
+#undef MAP
+        const std::span<VkBool32> left = FeatureBools(rest, size);
+        if (unmapped || std::ranges::any_of(left, [](VkBool32 b) { return b != VK_FALSE; })) {
+            return fail(fmt::format("Vulkan core features (type {}) the emulator doesn't enable "
+                                    "on this driver",
+                                    static_cast<int>(type)));
+        }
+    }
+
+    for (VkBool32* const member : enable) {
+        *member = VK_TRUE;
+    }
+    auto* tail = reinterpret_cast<VkBaseOutStructure*>(&features2);
+    for (VkBaseOutStructure* const structure : append) {
+        bool linked = false;
+        for (auto* it = reinterpret_cast<VkBaseOutStructure*>(&features2); it != nullptr;
+             it = it->pNext) {
+            linked |= it == structure;
+        }
+        if (linked) {
+            continue;
+        }
+        while (tail->pNext != nullptr) {
+            tail = tail->pNext;
+        }
+        structure->pNext = nullptr;
+        tail->pNext = structure;
+    }
+    LOG_INFO(Render_Vulkan, "Intel XeSS device features: {} enabled", enable.size());
+    return true;
+}
+
 bool Device::GetSuitability(bool requires_swapchain) {
     // Assume we will be suitable.
     bool suitable = true;
@@ -1308,6 +1580,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
                  all ? "enabled" : "unavailable", names.empty() ? "none" : names);
     }
 #endif
+    AddXessExtensions();
 
 #undef FEATURE_EXTENSION
 #undef EXTENSION

@@ -239,8 +239,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         }
 #endif
 #ifndef _WIN32
-        // AMD's FSR 4 runtime is Windows-only.
-        if (setting->Id() == Settings::values.amd_fsr4.Id()) {
+        // AMD's FSR 4 runtime and Intel's XeSS runtime are Windows-only.
+        if (setting->Id() == Settings::values.amd_fsr4.Id() ||
+            setting->Id() == Settings::values.intel_xess.Id()) {
             continue;
         }
 #endif

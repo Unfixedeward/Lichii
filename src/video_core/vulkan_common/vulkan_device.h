@@ -302,6 +302,11 @@ public:
         return instance;
     }
 
+    /// Intel XeSS's device extensions and features are enabled (XessRuntime::Wanted()).
+    bool IsXessReady() const {
+        return xess_ready;
+    }
+
     VkPipelineCache StaticPipelineCache() const noexcept {
         return *static_pipeline_cache;
     }
@@ -1271,6 +1276,13 @@ private:
     /// with all necessary info about its properties.
     bool GetSuitability(bool requires_swapchain);
 
+    /// Adds the device extensions Intel's XeSS asks for, when it's wanted and the device has them.
+    void AddXessExtensions();
+
+    /// Enables the device features XeSS asks for on top of the emulator's own. False, with nothing
+    /// changed, when it asks for a feature the device lacks or this can't place in the chain.
+    bool EnableXessFeatures();
+
     // Remove extensions which have incomplete feature support.
     void RemoveUnsuitableExtensions();
 
@@ -1423,6 +1435,12 @@ private:
     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
     bool streamline_extensions{}; ///< NVIDIA DLSS's extensions are loaded.
     bool streamline_attached{};   ///< Streamline has this device.
+    bool xess_extensions{};       ///< Intel XeSS's device extensions are loaded.
+    bool xess_ready{};            ///< XeSS's extensions and features are enabled.
+    std::vector<std::string> xess_required_extensions; ///< What XeSS asked for.
+    std::vector<std::string> xess_added_extensions;    ///< Loaded only for XeSS.
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT xess_mutable_descriptor{};
+    VkPhysicalDeviceShaderIntegerDotProductFeatures xess_integer_dot_product{};
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
