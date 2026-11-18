@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/logging.h"
@@ -344,8 +343,9 @@ void QtConfig::ReadMultiplayerValues() {
     size = BeginArray(std::string("ip_ban_list"));
     UISettings::values.multiplayer_ban_list.second.resize(size);
     for (int i = 0; i < size; ++i) {
+        SetArrayIndex(i);
         UISettings::values.multiplayer_ban_list.second[i] =
-            ReadStringSetting("username", std::string(""));
+            ReadStringSetting(std::string("ip"), std::string(""));
     }
     EndArray();
 

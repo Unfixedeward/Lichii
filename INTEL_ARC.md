@@ -8,7 +8,7 @@ behaves like upstream.
 It's unofficial. Report problems with these builds in this fork's
 [issues](https://github.com/Unfixedeward/Lichii/issues), not to upstream.
 
-On an Arc B580 (driver 101.9150, i7-11700F) with upstream build 130 and these changes, Ocarina's
+Measured on an Arc B580 (driver 101.9150, i7-11700F) with upstream build 130 and these changes, Ocarina's
 intro and title screen run at 60 fps, and Hyrule Field at a median of about 37 fps, 45-52 in
 stretches and 60 in lighter areas. The same PC ran it at about 10 fps before these fixes.
 
@@ -18,8 +18,11 @@ stretches and 60 in lighter areas. The same PC ran it at about 10 fps before the
    build. On Windows, the **PGO zip** is the one to try first; the standard zip is the fallback if
    it doesn't start.
 2. Extract the whole zip somewhere and run `lichii.exe`.
-3. Saves, settings, keys and shader caches are shared with other Lichii and Eden builds. Games, keys
-   and firmware are not included: use only what you've legally dumped yourself.
+3. Since upstream build 150, Lichii keeps its data in `%APPDATA%\lichii` instead of
+   `%APPDATA%\eden`, and the first launch asks what to do with the old folder. **Link Old
+   Directory** keeps a single folder that older builds use too, with your saves, settings, keys,
+   shader caches and `nx2_switches.txt` as they are. **Keep Old Data** copies it instead. Games,
+   keys and firmware are not included: use only what you've legally dumped yourself.
 4. The built-in updater offers new releases of this fork (not upstream ones, which lack the fixes).
 
 Suggested settings: GPU Accuracy **Fast**, Async shaders **On**. In Ocarina's per-game settings,
@@ -38,8 +41,8 @@ intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 |---|---|---|
 | Game's matrix math on the Arc's matrix units (XMX) | Ocarina's sharpening network uses the Switch 2's matrix instructions. Upstream only runs them on matrix units with a 16x8x16 or 16x16x16 shape; Arc (Xe2) offers 8x16x16, so each one now runs as two 8-row products (zortos293/Lichii#779 by Dylan Hachmann, by way of Fritchii). On a B580 under Linux this took the intro from 12 to 60 fps; on Windows (driver 101.9150) the log says "Guest tensor operations run on 8x16x16 cooperative matrices" when it's on. | `EDEN_NX2_INTEL_XMX=0` turns it off |
 | Faster software tensor math (fallback) | When the matrix units can't be used, the software path reads other lanes with quad and subgroup broadcasts instead of per-lane shuffles, which Intel's compiler turns into slow indirect register reads. On the Frizti fork this took a B580 from about 10 to 30+ fps. | `EDEN_NX2_HMMA_BROADCAST=0` turns it off |
-| Counter reports wait for their fence at Fast/Low GPU accuracy | Based on upstream PR #337, limited to occlusion counters. Fixes white flashes on leaves and walls. | `EDEN_NX2_FENCE_REPORTS=0` off, `=2` also semaphore reports |
-| Shader barriers kept on discrete Arc cards | Upstream removes them on every Intel GPU, a workaround for old integrated-GPU drivers. Integrated GPUs keep the workaround. | `EDEN_NX2_INTEL_STRIP_BARRIERS=1` removes them |
+| Only counter reports wait for their fence at Fast/Low GPU accuracy | Upstream PR #337 makes every fence-flagged report wait for its fence, which fixes white flashes on leaves and walls. A semaphore payload is known when it is sent, so here it still lands at once: holding it turned the waits on it into drains (about 3 fps in Kokiri Forest on a B580). | `EDEN_NX2_FENCE_REPORTS=2` every report (upstream), `=0` none |
+| Shader barriers | Since build 228 this is upstream's: on Intel, barriers in uniform control flow stay, and divergent ones become memory barriers or, in compute shaders, run whenever the whole workgroup agrees (#1677, #1742). Before, this fork kept every barrier on discrete Arc cards, which `=0` still does. | `EDEN_NX2_INTEL_STRIP_BARRIERS=0` keeps every barrier |
 | Occlusion checks resolved on discrete Arc cards | Upstream skips them on Intel at Fast/Low accuracy, which draws glows and flares that should be hidden behind walls. | `EDEN_NX2_INTEL_SKIP_OCCLUSION=1` skips them |
 | Optional native float16 on Intel | Off by default, as upstream. | `EDEN_NX2_INTEL_FP16=1` |
 | ASTC textures with unset component types read correctly | Ocarina's sRGB ASTC 10x6 textures were read as plain pixels. | none |
@@ -48,14 +51,44 @@ intro and cutscenes at 11 fps on a B580 with the audio falling behind.
 | Dynamic vertex input on discrete Arc cards | Lichii's old-driver check reads Intel's version numbers wrongly and turned VK_EXT_vertex_input_dynamic_state off on every Intel driver. Discrete Arc cards keep it (integrated GPUs don't). It also lets shader caches made on NVIDIA or AMD match. | `EDEN_NX2_INTEL_VIDS=0` turns it off |
 | Shader caches from another GPU or driver | Upstream build 130 has a new shader cache (v2) whose pipeline keys leave out the driver, so a driver update or a cache made on another PC is used as it is. Older caches are converted on first boot. | none |
 | No white fog at Hyrule Field's drawbridge | Upstream #820 emulates "noperspective" varyings for every GPU; it fixes a red line in the Royal Family's Tomb that only AMD's driver draws, and made the drawbridge fog solid white (Fritchii reverted it). Off here. | `EDEN_NX2_NOPERSP_AS_SMOOTH=1` turns it on |
-| Quitting waits for a long shutdown | With a large shader cache, writing it and freeing tens of thousands of pipelines outlasted the stop timeout, and the emulation thread was killed mid-way. It now waits while the shutdown still makes progress (from Fritchii). | none |
+| Intel XeSS upscaling in Ocarina of Time | See [Intel XeSS](#intel-xess) below. | Graphics setting, or `EDEN_NX2_XESS=1` |
+| Quitting waits for a long shutdown | This fork's fix from Fritchii is in upstream since build 177 (#1576). | none |
 
 ### Switches
 
 Switches are `NAME=VALUE` lines, one per line, in `nx2_switches.txt`; `#` starts a comment. Put
-your own in `%APPDATA%\eden\nx2_switches.txt` on Windows (create it if it's missing), which
-overrides the `nx2_switches.txt` next to `lichii.exe` and survives updates. They're read when
-Lichii starts.
+your own in `%APPDATA%\lichii\nx2_switches.txt` on Windows (`%APPDATA%\eden` before build 150;
+with Link Old Directory they're the same file), which overrides the `nx2_switches.txt` next to
+`lichii.exe` and survives updates. They're read when Lichii starts.
+
+## Intel XeSS
+
+Upstream lets Ocarina of Time replace its own upscaler with AMD FSR 3.1 (or FSR 4 on Radeon). This
+fork adds Intel's XeSS Super Resolution as a third choice, through Intel's XeSS SDK 3.0.2 for
+Vulkan. On Arc it runs on the matrix units (XMX); other GPUs run Intel's slower DP4a version.
+
+To turn it on, in Graphics:
+
+1. **Use AMD FSR 3.1 upscaling in Ocarina of Time**: on (this is the switch that replaces the
+   game's upscaler).
+2. **Use Intel XeSS in place of FSR 3.1**: on.
+
+Restart the game. The log then shows `Intel XeSS: ... (Quality preset)` once and
+`Ocarina XeSS evaluated` lines every 120 frames. If XeSS can't run, the log says why and FSR is
+used instead.
+
+- XeSS needs Intel's `libxess.dll` next to `lichii.exe`. The Windows release zips include it, with
+  Intel's licence in `LICENSE-XeSS.txt`. Only a DLL signed by Intel Corporation is loaded.
+- Lichii's glow and particle mask (made for FSR) isn't given to XeSS, as Intel advises unless it
+  clearly helps: XeSS drops its history wherever it's set. `EDEN_NX2_XESS_MASK=1` gives it anyway.
+- The preset follows Lichii's resolution: XeSS picks the preset whose input range holds the
+  render size. The RCAS sharpness slider doesn't apply to XeSS.
+- `EDEN_NX2_XESS_JITTER=flipy` (or `flipx`, `flipxy`) flips the camera jitter for XeSS, and
+  `EDEN_NX2_XESS_MOTION` the same for motion. XeSS takes the same values as FSR by default. If
+  fine detail (grass, fences) shimmers while Link stands still, try `EDEN_NX2_XESS_JITTER=flipy`.
+- XeSS Frame Generation isn't available: Intel only offers it for DirectX 12, and Lichii renders
+  with Vulkan. Upstream's own frame generation runs on any GPU, Arc included: Graphics, **Enable Frame
+  Generation**, type **Optical Flow Interpolation (built-in)**.
 
 ## Building from source
 
@@ -72,4 +105,5 @@ Visual Studio 2022 doesn't need it.
 
 All the emulator work belongs to the Lichii, Eglantine, Eden, yuzu and Sudachi developers; see
 [README.md](README.md#credits-and-license). The Intel Arc fixes are released under the same
-license (GPL-3.0-or-later).
+license (GPL-3.0-or-later). XeSS is Intel's: the SDK headers in `externals/xess` are MIT, and
+`libxess.dll` is distributed unmodified under the Intel Simplified Software License.

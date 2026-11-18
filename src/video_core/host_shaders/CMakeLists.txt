@@ -86,6 +86,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp32.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_rcas_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_rcas_fp32.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_hdr_convert.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp16.frag
@@ -108,6 +109,9 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_output.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_composite.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_effects.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_effects_base.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_bias.comp
 )
 
 if (HAIKUOS)
@@ -231,12 +235,16 @@ foreach(VARIANT IN ITEMS ${SHADER_TYPE_VARIANTS})
 endforeach()
 
 # AMD FidelityFX Super Resolution 3.1 upscaler (externals/FidelityFX-SDK, unmodified): the SDK's
-# Vulkan pass files, compiled with one set of options (render-size motion vectors, reversed depth,
-# HDR colour, reference Lanczos), plus the sharpening and the no-wave-operation SPD variants.
-set(FSR3_GPU_DIR ${CMAKE_SOURCE_DIR}/externals/FidelityFX-SDK/include/FidelityFX/gpu)
-set(FSR3_PASS_DIR ${CMAKE_SOURCE_DIR}/externals/FidelityFX-SDK/shaders/fsr3upscaler)
-file(GLOB FSR3_GPU_FILES ${FSR3_GPU_DIR}/*.h ${FSR3_GPU_DIR}/fsr1/*.h ${FSR3_GPU_DIR}/spd/*.h
-     ${FSR3_GPU_DIR}/fsr3upscaler/*.h)
+# Vulkan pass files: HDR/reversed depth and OoT's LDR/standard depth profiles, plus sharpening
+# and no-wave-operation SPD variants. Both use render-size motion and reference Lanczos.
+# The GPU code is SDK v2.4.0's; the GLSL glue (passes, callbacks, ffx_core_glsl.h) is v1.1.4's.
+set(FSR3_SDK_DIR ${CMAKE_SOURCE_DIR}/externals/FidelityFX-SDK)
+set(FSR3_GLSL_DIR ${FSR3_SDK_DIR}/include/FidelityFX/gpu)
+set(FSR3_GPU_DIR ${FSR3_SDK_DIR}/Kits/FidelityFX/upscalers/fsr3/include/gpu)
+set(FSR3_CORE_DIR ${FSR3_SDK_DIR}/Kits/FidelityFX/api/internal/gpu)
+set(FSR3_PASS_DIR ${FSR3_SDK_DIR}/shaders/fsr3upscaler)
+file(GLOB FSR3_GPU_FILES ${FSR3_GLSL_DIR}/*.h ${FSR3_GLSL_DIR}/fsr3upscaler/*.h ${FSR3_CORE_DIR}/*.h
+     ${FSR3_GPU_DIR}/fsr1/*.h ${FSR3_GPU_DIR}/spd/*.h ${FSR3_GPU_DIR}/fsr3upscaler/*.h)
 set(FSR3_FLAGS
     -DFFX_GPU=1
     -DFFX_GLSL=1
@@ -246,10 +254,8 @@ set(FSR3_FLAGS
     -DFFX_FSR3UPSCALER_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF=0
     -DFFX_FSR3UPSCALER_OPTION_UPSAMPLE_USE_LANCZOS_TYPE=2
     -DFFX_FSR3UPSCALER_OPTION_REPROJECT_USE_LANCZOS_TYPE=0
-    -DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=1
     -DFFX_FSR3UPSCALER_OPTION_LOW_RESOLUTION_MOTION_VECTORS=1
     -DFFX_FSR3UPSCALER_OPTION_JITTERED_MOTION_VECTORS=0
-    -DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=1
 )
 set(FSR3_VARIANTS
     "prepare_inputs|prepare_inputs|none"
@@ -265,6 +271,7 @@ set(FSR3_VARIANTS
     "rcas|rcas|none"
 )
 
+foreach(FSR3_PROFILE IN ITEMS hdr ldr)
 foreach(VARIANT IN ITEMS ${FSR3_VARIANTS})
     string(REPLACE "|" ";" VARIANT_PARTS "${VARIANT}")
     list(GET VARIANT_PARTS 0 FSR3_NAME)
@@ -277,14 +284,23 @@ foreach(VARIANT IN ITEMS ${FSR3_VARIANTS})
         list(APPEND FSR3_DEFINE -DFFX_FSR3UPSCALER_OPTION_APPLY_SHARPENING=0)
     endif()
     set(FSR3_SOURCE ${FSR3_PASS_DIR}/ffx_fsr3upscaler_${FSR3_PASS}_pass.glsl)
+    if (FSR3_PROFILE STREQUAL "ldr")
+        set(FSR3_PROFILE_FLAGS -DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=0
+                               -DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=0)
+        string(APPEND FSR3_NAME "_ldr")
+    else()
+        set(FSR3_PROFILE_FLAGS -DFFX_FSR3UPSCALER_OPTION_HDR_COLOR_INPUT=1
+                               -DFFX_FSR3UPSCALER_OPTION_INVERTED_DEPTH=1)
+    endif()
     string(TOUPPER fsr3_upscaler_${FSR3_NAME}_comp_spv FSR3_VARIABLE_NAME)
     set(FSR3_HEADER_FILE ${SHADER_DIR}/fsr3_upscaler_${FSR3_NAME}_comp_spv.h)
     add_custom_command(
         OUTPUT
             ${FSR3_HEADER_FILE}
         COMMAND
-            ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -S comp -I"${FSR3_GPU_DIR}"
-            -I"${FSR3_GPU_DIR}/fsr3upscaler" ${FSR3_FLAGS} ${FSR3_DEFINE}
+            ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -S comp -I"${FSR3_GLSL_DIR}"
+            -I"${FSR3_GPU_DIR}" -I"${FSR3_GPU_DIR}/fsr3upscaler" -I"${FSR3_CORE_DIR}"
+            ${FSR3_FLAGS} ${FSR3_PROFILE_FLAGS} ${FSR3_DEFINE}
             --variable-name ${FSR3_VARIABLE_NAME} -o ${FSR3_HEADER_FILE} ${FSR3_SOURCE}
             --target-env ${SPIR_V_VERSION}
         MAIN_DEPENDENCY
@@ -293,6 +309,7 @@ foreach(VARIANT IN ITEMS ${FSR3_VARIANTS})
             ${FSR3_GPU_FILES}
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} ${FSR3_HEADER_FILE})
+endforeach()
 endforeach()
 
 foreach(FILEPATH IN ITEMS ${FIDELITYFX_FILES})

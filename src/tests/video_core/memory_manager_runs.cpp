@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <random>
+#include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -98,7 +101,68 @@ TEST_CASE("A 40-bit address space maps Switch 2 VA past 128 GiB", "[memory_manag
     REQUIRE(memory.GpuToCpuAddress(last_page) == last_dev);
 }
 
-TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[memory_manager]") {
+TEST_CASE("Device space freed and mapped again every frame stays in place", "[memory_manager]") {
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    // The Yoshi demo frees a 1.5 MiB range and maps it again each frame. The free runs on the GPU
+    // thread, so the next frame's allocation can come first.
+    constexpr size_t size = 0x180000;
+    DAddr previous = device_memory.Allocate(size);
+    const DAddr lowest = previous;
+    DAddr highest = previous;
+    for (int frame = 0; frame < 1000; ++frame) {
+        const DAddr next = device_memory.Allocate(size);
+        device_memory.Free(previous, size);
+        previous = next;
+        highest = std::max(highest, next);
+    }
+    REQUIRE(highest - lowest <= 2 * size);
+
+    // Another size doesn't take the freed block.
+    const DAddr other = device_memory.Allocate(0x20000);
+    REQUIRE(other > highest);
+    device_memory.Free(previous, size);
+    REQUIRE(device_memory.Allocate(size) == previous);
+}
+
+TEST_CASE("Kept device blocks go back to the allocator when it runs out", "[memory_manager]") {
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    // Fill the device space with a 1 GiB block between two others, free that block, then ask for
+    // 512 MiB: no kept block has that size and the allocator has no space left.
+    constexpr size_t freed_size = 1ULL << 30;
+    REQUIRE(device_memory.Allocate(0x20000) != 0);
+    const DAddr freed = device_memory.Allocate(freed_size);
+    REQUIRE(freed != 0);
+    const size_t rest =
+        (1ULL << Tegra::MaxwellDeviceMemoryManager::AS_BITS) - 1 - freed - freed_size;
+    REQUIRE(device_memory.Allocate(rest) != 0);
+    device_memory.Free(freed, freed_size);
+    REQUIRE(device_memory.Allocate(512ULL << 20) == freed);
+}
+
+TEST_CASE("An allocation fits once every kept device block is given back", "[memory_manager]") {
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    const DAddr first = device_memory.Allocate(1ULL << 30);
+    REQUIRE(first != 0);
+    device_memory.Free(first, 1ULL << 30);
+    REQUIRE(device_memory.Allocate(63ULL << 30) == first);
+}
+
+TEST_CASE("A device allocation larger than the space fails after kept blocks are given back",
+          "[memory_manager]") {
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    const DAddr first = device_memory.Allocate(1ULL << 30);
+    REQUIRE(first != 0);
+    device_memory.Free(first, 1ULL << 30);
+    REQUIRE(device_memory.Allocate(65ULL << 30) == 0);
+    REQUIRE(device_memory.Allocate(1ULL << 30) == first);
+}
+
+TEST_CASE("MaxContinuousRange and submapped ranges from the mapping runs match the page walk",
+          "[memory_manager]") {
     const u64 big_page_bits = GENERATE(16ULL, 17ULL);
     CAPTURE(big_page_bits);
     ScopedSystemTestContext context;
@@ -124,6 +188,10 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         REQUIRE(memory.MaxContinuousRange(address, size) ==
                 memory.MaxContinuousRangeUncached(address, size));
         REQUIRE(memory.GetMemoryLayoutSize(address) == memory.GetMemoryLayoutSizeUncached(address));
+        REQUIRE(memory.GetSubmappedRange(address, size) ==
+                memory.GetSubmappedRangeUncached(address, size));
+        REQUIRE(memory.GetSubmappedDeviceRange(address, size) ==
+                memory.GetSubmappedDeviceRangeUncached(address, size));
     };
 
     // Known answers first, so the comparison isn't between two zeros.
@@ -138,8 +206,22 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
     memory.MapSparse(window + 3 * big_page, big_page, true);
     REQUIRE(memory.MaxContinuousRange(window + 2 * big_page, 16ULL << 20) == big_page);
     REQUIRE(memory.MaxContinuousRange(window + 3 * big_page, 16ULL << 20) == 0);
+    const auto device_segments = memory.GetSubmappedDeviceRange(window + 0x10, 4 * big_page);
+    REQUIRE(device_segments.size() == 3);
+    REQUIRE(device_segments[0] == std::pair<DAddr, size_t>{0x1000'0010, 2 * big_page - 0x10});
+    REQUIRE(device_segments[1] == std::pair<DAddr, size_t>{0x2000'0000, big_page});
+    REQUIRE(device_segments[2] == std::pair<DAddr, size_t>{0x1000'0000 + 4 * big_page, 0x10});
     memory.Unmap(window, 8 * big_page);
     REQUIRE(memory.MaxContinuousRange(window, 16ULL << 20) == 0);
+    REQUIRE(memory.GetSubmappedRange(window, 16ULL << 20).empty());
+
+    // Pages contiguous in GPU memory and mapped backwards in device memory: one segment each.
+    for (u64 page = 0; page < 4; ++page) {
+        memory.Map(window + page * small_page, 0x3000'0000 + (3 - page) * small_page, small_page,
+                   Tegra::PTEKind::PITCH, false);
+    }
+    REQUIRE(memory.GetSubmappedRange(window + 0x800, 3 * small_page).size() == 4);
+    memory.Unmap(window, 4 * small_page);
 
     DAddr next_device = 0x1000'0000;
     u64 nonzero = 0;
@@ -256,4 +338,23 @@ TEST_CASE("Reads of GPU pages over unmapped device memory return zeros", "[memor
     std::ranges::fill(bytes, u8{0xcd});
     memory.ReadBlock(window, bytes.data(), size);
     REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+}
+
+TEST_CASE("Device unmaps wait for deferred page count changes", "[memory_manager]") {
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    device_memory.BindInterface(&rasterizer);
+
+    device_memory.BeginDeferredCachedUpdates();
+    std::atomic<bool> unmapped{};
+    std::thread unmapper{[&] {
+        device_memory.Unmap(0x10000, 0x1000);
+        unmapped = true;
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(unmapped);
+    device_memory.EndDeferredCachedUpdates();
+    unmapper.join();
+    REQUIRE(unmapped);
 }

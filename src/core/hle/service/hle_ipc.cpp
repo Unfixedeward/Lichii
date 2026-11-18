@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -452,6 +451,23 @@ std::size_t HLERequestContext::WriteBufferC(const void* buffer, std::size_t size
 
     memory.WriteBlock(BufferDescriptorC()[buffer_index].Address(), buffer, size);
     return size;
+}
+
+void HLERequestContext::ReadWriteBufferContents(std::span<u8> out, bool buffer_b,
+                                                std::size_t buffer_index) const {
+    if (buffer_b) {
+        if (buffer_index < BufferDescriptorB().size()) {
+            const auto& descriptor = BufferDescriptorB()[buffer_index];
+            memory.ReadBlock(descriptor.Address(), out.data(),
+                             (std::min)(out.size(), static_cast<std::size_t>(descriptor.Size())));
+        }
+        return;
+    }
+    if (buffer_index < BufferDescriptorC().size()) {
+        const auto& descriptor = BufferDescriptorC()[buffer_index];
+        memory.ReadBlock(descriptor.Address(), out.data(),
+                         (std::min)(out.size(), static_cast<std::size_t>(descriptor.Size())));
+    }
 }
 
 std::size_t HLERequestContext::GetReadBufferSize(std::size_t buffer_index) const {

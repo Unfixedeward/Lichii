@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <future>
 #include <optional>
 #include <span>
@@ -16,6 +17,7 @@
 #include <ranges>
 #include <vulkan/vulkan_core.h>
 #include "core/frontend/emu_window.h"
+#include "video_core/vulkan_common/vulkan_address_map.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_STREAMLINE
@@ -23,6 +25,9 @@
 #include <string>
 #include "video_core/vulkan_common/streamline.h"
 #endif
+#include <algorithm>
+#include <string_view>
+#include "video_core/vulkan_common/xess_runtime.h"
 
 namespace Vulkan {
 namespace {
@@ -44,9 +49,16 @@ namespace {
     const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties,
     Core::Frontend::WindowSystemType window_type, bool enable_validation) {
     std::vector<const char*> extensions;
-    extensions.reserve(6);
+    extensions.reserve(7);
+    // Headless presents to VK_EXT_headless_surface where the driver has it (GPU trace replay).
+    const bool headless_surface =
+        window_type == Core::Frontend::WindowSystemType::Headless &&
+        AreExtensionsSupported(dld, properties, std::array{VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME});
     switch (window_type) {
     case Core::Frontend::WindowSystemType::Headless:
+        if (headless_surface) {
+            extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
+        }
         break;
 #ifdef _WIN32
     case Core::Frontend::WindowSystemType::Windows:
@@ -76,8 +88,21 @@ namespace {
         LOG_ERROR(Render_Vulkan, "Presentation not supported on this platform");
         break;
     }
-    if (window_type != Core::Frontend::WindowSystemType::Headless) {
+    if (window_type != Core::Frontend::WindowSystemType::Headless || headless_surface) {
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        if (std::ranges::any_of(properties, [](const VkExtensionProperties& property) {
+                return std::strcmp(property.extensionName,
+                                   VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0;
+            })) {
+            extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        }
+        // Surface queries for present ids and present waits (VK_KHR_present_id2/wait2).
+        if (std::ranges::any_of(properties, [](const VkExtensionProperties& property) {
+                return std::strcmp(property.extensionName,
+                                   VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+            })) {
+            extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        }
     }
     // Probe optional extensions against the same snapshot the caller verifies against, so the
     // check here and the verification in CreateInstance can never disagree (see TOCTOU note below).
@@ -85,7 +110,8 @@ namespace {
     if (AreExtensionsSupported(dld, properties, std::array{VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME}))
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 #endif
-    if (enable_validation && AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
+    if ((enable_validation || Vulkan::AddressMap::Wanted()) &&
+        AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #ifdef EGLANTINE_STREAMLINE
     // What NVIDIA's DLSS asks for through Streamline, where available. Static: the returned
@@ -102,6 +128,30 @@ namespace {
         }
     }
 #endif
+    // What Intel's XeSS asks for, when it's turned on and Intel's runtime loads.
+    if (XessRuntime::Wanted()) {
+        if (const XessRuntime::Api* const xess = XessRuntime::Get()) {
+            u32 count = 0;
+            const char* const* names = nullptr;
+            u32 min_version = 0;
+            const xess_result_t result =
+                xess->vk_get_required_instance_extensions(&count, &names, &min_version);
+            if (result != XESS_RESULT_SUCCESS) {
+                LOG_WARNING(Render_Vulkan, "Intel XeSS: instance extensions unknown ({})",
+                            XessRuntime::ResultName(result));
+            }
+            for (u32 i = 0; result == XESS_RESULT_SUCCESS && i < count; ++i) {
+                const std::string_view name = names[i];
+                const bool listed =
+                    std::ranges::any_of(extensions, [&](const char* e) { return name == e; });
+                const bool available = std::ranges::any_of(
+                    properties, [&](const VkExtensionProperties& p) { return name == p.extensionName; });
+                if (!listed && available) {
+                    extensions.push_back(names[i]);
+                }
+            }
+        }
+    }
     return extensions;
 }
 
@@ -179,6 +229,12 @@ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceD
     if (!vk::Load(*instance, dld)) {
         LOG_ERROR(Render_Vulkan, "Failed to load Vulkan instance function pointers");
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    // A loader may return entry points of extensions the instance did not enable.
+    if (std::ranges::none_of(extensions, [](const char* name) {
+            return std::strcmp(name, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        })) {
+        dld.vkGetPhysicalDeviceSurfaceCapabilities2KHR = nullptr;
     }
     return instance;
 }

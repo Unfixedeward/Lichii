@@ -94,8 +94,14 @@ u32 EvaluateShift(IR::Value value) {
         return std::bit_cast<u32>(std::fma(std::bit_cast<float>(arg(0)),
                                          std::bit_cast<float>(arg(1)),
                                          std::bit_cast<float>(arg(2))));
+    case IR::Opcode::IAdd32:
+        return arg(0) + arg(1);
+    case IR::Opcode::INeg32:
+        return 0U - arg(0);
     case IR::Opcode::BitwiseAnd32:
         return arg(0) & arg(1);
+    case IR::Opcode::BitwiseOr32:
+        return arg(0) | arg(1);
     case IR::Opcode::ULessThan:
         return arg(0) < arg(1);
     case IR::Opcode::SelectU32:
@@ -176,8 +182,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
         for (size_t index = 0; index + 1 < lowered.instructions.size(); ++index)
             CHECK(((lowered.instructions[index] >> 16) & 15) == guard);
     }
-    for (const u32 source : {0x80c03400U, 0xc0c03400U, 0x44c03400U, 0x40c03440U,
-                             0x48c03400U, 0x50c03400U, 0x60c03400U}) {
+    for (const u32 source : {0x44c03400U, 0x40c03440U, 0x48c03400U, 0x50c03400U, 0x60c03400U}) {
         auto invalid = LoggedF2I;
         invalid.words[1] = source;
         CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
@@ -193,7 +198,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
     invalid = LoggedF2I;
     invalid.words[2] |= 1U << 27;
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
-    invalid.words = {0x00157b05, 0x40400400, 0x0021e100, 0x0001e400};
+    invalid.words = {0x00157b05, 0x00400440, 0x0021e100, 0x0001e400};
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
 }
 
@@ -318,6 +323,55 @@ TEST_CASE("Logged Ocarina uniform IMAD preserves high destinations across unifor
         REQUIRE(lowered);
         CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(),
                          lowered.instructions.begin()));
+    }
+}
+
+TEST_CASE("Logged Ocarina uniform SHF preserves high registers across uniform mirrors",
+          "[video_core][ampere][logged_numeric][ocarina]") {
+    using Shader::Ampere::NativeRegisterCopy;
+    // Two mesh programs: @P2 SHF.L.W.U32 R200 = R200 << UR6 was rejected with "native register
+    // shadowing mode", so the draw was skipped. Their high uniform registers put R200 inside
+    // the uniform mirrors.
+    constexpr Instruction shift{{0xc8c82c19, 0x00000006, 0x08000eff, 0x000fc800}};
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(shift, 200);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.words[0] == 0xc4c42c19);
+    CHECK(pressure.instruction.words[1] == shift.words[1]);
+    CHECK(pressure.instruction.words[2] == shift.words[2]);
+    CHECK(pressure.instruction.words[3] == shift.words[3]);
+    REQUIRE(pressure.prefix.size() == 8);
+    REQUIRE(pressure.suffix.size() == 8);
+
+    // MOV R0, UR42 moves the mirrors of UR28 and up down to R200.
+    constexpr Instruction high_uniform{{0x00007c02, 0x0000002a, 0x08000f00, 0}};
+    for (const u32 guard : {2U, 7U}) {
+        auto guarded = shift;
+        guarded.words[0] = (guarded.words[0] & ~0xf000U) | (guard << 12);
+        const auto lowered = LowerToMaxwell(std::array{high_uniform, guarded, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        REQUIRE(lowered.instructions.size() == 19);
+        CHECK(std::equal(pressure.prefix.begin(), pressure.prefix.end(),
+                         lowered.instructions.begin() + 1));
+        CHECK(std::equal(pressure.suffix.begin(), pressure.suffix.end(),
+                         lowered.instructions.begin() + 10));
+        CHECK(lowered.instructions[9] ==
+              (0x5bf8000000000000ULL | (u64{guard} << 16) | 196 | (255ULL << 8) | (222ULL << 20) |
+               (196ULL << 39) | (1ULL << 50)));
+        if (guard != 7)
+            continue;
+        for (const u32 amount : {0U, 3U, 31U, 35U}) {
+            auto code = lowered.instructions;
+            code.insert(code.begin(), NativeRegisterCopy(1, 200, 0, 0));
+            code.insert(code.begin(),
+                        0x0100000000070000ULL | (15ULL << 12) | (0x81234567ULL << 20));
+            code.insert(code.begin(),
+                        0x0100000000070000ULL | 222 | (15ULL << 12) | (u64{amount} << 20));
+            code.insert(code.end() - 1, NativeRegisterCopy(0, 0, 1, 200));
+            code.insert(code.end() - 1, Store(0));
+            CAPTURE(amount);
+            TranslateAndEmit(code, 0x81234567U << (amount & 31));
+        }
     }
 }
 
@@ -539,4 +593,29 @@ TEST_CASE("Gradient texture fetch shadows keep the array layer register",
     CHECK(((*native >> 8) & 0xff) == 210);
     const u32 gradients = static_cast<u32>((*native >> 20) & 0xff);
     CHECK((gradients + 4 <= 210 || gradients >= 213));
+}
+
+TEST_CASE("Logged Orbitals IMAD with a negated register addend",
+          "[video_core][ampere][logged_numeric][orbitals]") {
+    // IMAD R3 = R2 * R3 - R5 in a gameplay compute shader: bit 75 negates the addend. It was
+    // rejected with "native integer register multiply mode", so its dispatches were skipped.
+    constexpr Instruction logged{{0x02037224, 0x00000003, 0x078e0a05, 0x000fca00}};
+    constexpr u32 a = 0x00012345, b = 0x00010003, c = 0x00001000;
+    const auto run = [&](Instruction instruction, u32 expected) {
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        auto code = lowered.instructions;
+        for (const auto& [reg, value] : {std::pair{2U, a}, std::pair{3U, b}, std::pair{5U, c}})
+            code.insert(code.begin(), 0x0100000000070000ULL | reg | (15ULL << 12) | (u64{value} << 20));
+        code.insert(code.end() - 1, Store(3));
+        TranslateAndEmit(code, expected);
+    };
+    run(logged, a * b - c);
+    auto positive = logged;
+    positive.words[2] &= ~0x800U;
+    run(positive, a * b + c);
+    auto zero_addend = logged;
+    zero_addend.words[2] |= 0xffU;
+    run(zero_addend, a * b);
 }

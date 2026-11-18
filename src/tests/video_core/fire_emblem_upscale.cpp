@@ -26,7 +26,9 @@ TICEntry Image(u32 address, u32 width, u32 height) {
 
 TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_upscale]") {
     REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, nullptr));
-    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, "fsr"));
+    for (const char* option : {"fsr", "dlss", "spatial"}) {
+        REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
+    }
     for (const char* option : {"native", "standin", "0", "", "10", "invalid"}) {
         REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
     }
@@ -173,6 +175,41 @@ TEST_CASE("Star Fox captured passes use the validated colour and jitter slots", 
     REQUIRE(fire_emblem);
     REQUIRE_FALSE(fire_emblem->spatial_only);
     REQUIRE_FALSE(FE::CapturedPasses(0x040074A01BF12000ULL));
+}
+
+TEST_CASE("Star Fox cutscene prepass opens the existing spatial replacement chain",
+          "[starfox_upscale]") {
+    const auto passes = FE::CapturedPasses(FE::StarFoxProgramId);
+    REQUIRE(passes);
+    for (const u64 prepass : {0xd686ca0b9fad9e6dULL, 0xebab31dd6f0fc08dULL}) {
+        REQUIRE(passes->IsPrepass(prepass));
+        REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(prepass));
+        REQUIRE_FALSE(FE::UseReplacement(FE::StarFoxProgramId, prepass, nullptr));
+        for (unsigned bit = 0; bit < 64; ++bit) {
+            REQUIRE_FALSE(passes->IsPrepass(prepass ^ (1ULL << bit)));
+        }
+    }
+    REQUIRE_FALSE(passes->IsPrepass(0));
+    REQUIRE_FALSE(passes->IsPrepass(FE::StarFoxOutputProgramKey));
+    REQUIRE_FALSE(passes->IsPrepass(FE::PrepassProgramKey));
+    REQUIRE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(FE::PrepassProgramKey));
+    REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(0));
+}
+
+TEST_CASE("Fire Emblem alternate prepass opens the replacement chain",
+          "[starfox_upscale]") {
+    const auto passes = FE::CapturedPasses(FE::ProgramId);
+    REQUIRE(passes);
+    for (const u64 prepass : {FE::PrepassProgramKey, FE::PrepassProgramKeyV111}) {
+        REQUIRE(passes->IsPrepass(prepass));
+        for (unsigned bit = 0; bit < 64; ++bit) {
+            REQUIRE_FALSE(passes->IsPrepass(prepass ^ (1ULL << bit)));
+        }
+    }
+    REQUIRE(passes->output == FE::OutputProgramKey);
+    REQUIRE_FALSE(passes->IsPrepass(0));
+    REQUIRE_FALSE(passes->IsPrepass(FE::StarFoxPrepassProgramKey));
+    REQUIRE_FALSE(FE::CapturedPasses(FE::StarFoxProgramId)->IsPrepass(FE::PrepassProgramKeyV111));
 }
 
 TEST_CASE("Star Fox logged native-resolution cutscene colour pair is accepted", "[starfox_upscale]") {

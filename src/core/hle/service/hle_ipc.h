@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -304,6 +303,10 @@ public:
     /// Helper function to write buffer C
     std::size_t WriteBufferC(const void* buffer, std::size_t size,
                              std::size_t buffer_index = 0) const;
+
+    /// Helper function to copy the guest's current contents of buffer B or C into out
+    void ReadWriteBufferContents(std::span<u8> out, bool buffer_b,
+                                 std::size_t buffer_index = 0) const;
 
     /* Helper function to write a buffer using the appropriate buffer descriptor
      *

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -108,9 +107,15 @@ public:
 
     u64 GetDeviceMemoryBudget() const;
 
+    u64 GetDeviceHeapMemoryBudget() const;
+
     u64 GetDeviceMemorySlack() const;
 
     bool CanReportMemoryUsage() const;
+
+    /// The largest width and height a scaled image may take: the device's 2D image and
+    /// framebuffer limits (16384 on AMD).
+    u32 GetMaxScaledExtent() const noexcept;
 
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
@@ -119,6 +124,11 @@ public:
 
     u32 FailedImages() const noexcept {
         return memory_allocator.FailedImages();
+    }
+
+    /// Device-local bytes placed in host memory since the last call (see MemoryAllocator).
+    u64 TakeSpilledBytes() const noexcept {
+        return memory_allocator.TakeSpilledBytes();
     }
 
     void LogMemoryStatistics() const;
@@ -156,8 +166,8 @@ public:
 
     /// Records a health check of a game's DLSS network output against its input (both sampled in
     /// the GENERAL layout) and returns an earlier check's result once the GPU has finished it.
-    [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(ImageView& input,
-                                                                              ImageView& output);
+    [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        ImageView& input, ImageView& output, std::optional<std::array<u32, 2>> input_region);
 
     void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
@@ -237,6 +247,8 @@ public:
 
     void BarrierFeedbackLoop();
 
+    VkImageView ResolveColorFeedback(const ImageView& sampled, const ImageView& attachment);
+
     bool IsFormatDitherable(VideoCore::Surface::PixelFormat format);
     bool IsFormatScalable(VideoCore::Surface::PixelFormat format);
 
@@ -258,6 +270,13 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
+    /// upscalers), resolved on first use.
+    [[nodiscard]] f32 OcarinaFsrLodBias();
+    std::optional<f32> ocarina_fsr_lod_bias;
+    /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
+    bool ocarina_fsr_failed{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -347,6 +366,17 @@ public:
         vk::Buffer bridge;
     };
     std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
+
+    struct ColorFeedbackSnapshot {
+        vk::Image image;
+        vk::ImageView view;
+        VideoCommon::Extent3D size;
+        VkComponentMapping swizzle;
+        u64 tick{};
+        u32 unused_frames{};
+        bool used_this_frame{};
+    };
+    std::vector<ColorFeedbackSnapshot> color_feedback_snapshots;
 };
 
 class Framebuffer {
@@ -484,6 +514,11 @@ public:
     Image& operator=(Image&&) = default;
 
     u32 HostMipLevels() const noexcept;
+
+    /// The format a copy out of the host image yields: the guest format, or what a converted one
+    /// (ASTC re-compressed to BC1/BC3 or decoded to RGBA8, BCn decoded without host support) is
+    /// kept as.
+    [[nodiscard]] VideoCore::Surface::PixelFormat HostFormat() const;
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
@@ -854,6 +889,7 @@ private:
         bool drop_custom_border;
         bool srgb_border;
         bool drop_compare;
+        bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -878,6 +914,7 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
@@ -888,6 +925,7 @@ private:
     bool has_added_anisotropy{};
     bool has_linear_filtering{};
     bool has_depth_comparison{};
+    f32 added_lod_bias{}; ///< Ocarina FSR part of base_ci.mipLodBias
     bool has_minmax_reduction{};
     bool has_custom_border_colors{};
     bool has_srgb_border_color{};

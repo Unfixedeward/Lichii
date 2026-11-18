@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -50,6 +49,9 @@ enum class Errno {
     MSGSIZE,
     INPROGRESS,
     ISCONN,
+    ADDRINUSE,
+    ADDRNOTAVAIL,
+    AFNOSUPPORT,
     OTHER,
 };
 
@@ -125,13 +127,25 @@ constexpr IPv4Address TranslateIPv4(in_addr addr) {
 std::optional<IPv4Address> GetHostIPv4Address();
 
 /// @brief Returns the fake IPv4 address of the joined room, the emulated network while in a room
-/// @return nullopt outside a room and while still joining it
+/// @return nullopt outside a room, while still joining it and while LAN play is active
 std::optional<IPv4Address> GetRoomIPv4Address();
+
+/// While LAN play carries LDN, the guest keeps host sockets and its real address in a room too
+bool IsDirectLanActive();
+void SetDirectLanActive(bool active);
 
 std::string IPv4AddressToString(IPv4Address ip_addr);
 u32 IPv4AddressToInteger(IPv4Address ip_addr);
 
+std::string IPv6AddressToString(IPv6Address ip_addr);
+
+/// The address as text: a.b.c.d:port, or [v6]:port for INET6
+std::string SockAddrToString(const SockAddrIn& addr);
+
 // named to avoid name collision with Windows macro
-std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(const std::string& host, const std::optional<std::string>& service);
+/// Resolves host for family INET (A records) or INET6 (AAAA records).
+std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
+    const std::string& host, const std::optional<std::string>& service,
+    Domain family = Domain::INET);
 
 } // namespace Network

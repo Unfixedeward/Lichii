@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
+#include <bit>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 #include <sirit/sirit.h>
+#include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
 #include "shader_recompiler/backend/bindings.h"
@@ -173,10 +176,27 @@ struct CooperativeHmmaTypes {
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
-                         IR::Program& program, Bindings& binding);
+                         IR::Program& program, Bindings& binding, bool vulkan_memory_model);
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    /// Workgroup memory loads and stores. GLSL450 keeps workgroup memory coherent within the
+    /// workgroup. Under the Vulkan memory model a plain access is private, so each one is
+    /// non-private and makes itself visible or available to the workgroup, as glslang does for
+    /// GLSL's shared variables.
+    [[nodiscard]] Id LoadShared(Id result_type, Id pointer);
+    void StoreShared(Id pointer, Id object);
+    /// The memory operands LoadShared and StoreShared use under the Vulkan memory model.
+    [[nodiscard]] std::array<Sirit::MemoryAccessLiteral, 2> SharedMemoryAccess(
+        spv::MemoryAccessMask availability);
+    /// Barrier semantics. Under the Vulkan memory model a barrier also makes the writes before it
+    /// available and the writes it orders visible.
+    [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
+    /// Workgroup memory semantics of a guest barrier.
+    [[nodiscard]] Id GuestBarrierSemantics();
+    /// The shared word ConditionalBarrierPass counts branch conditions in.
+    [[nodiscard]] Id BarrierVoteWord(Id offset);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -189,7 +209,7 @@ public:
     }
 
     Id Const(u32 value) {
-        return Constant(U32[1], value);
+        return CachedConstant(u32_constants, U32[1], value);
     }
 
     Id Const(u32 element_1, u32 element_2) {
@@ -223,13 +243,15 @@ public:
     }
 
     Id Const(f32 value) {
-        return Constant(F32[1], value);
+        return CachedConstant(f32_constants, F32[1], value);
     }
 
     const Profile& profile;
     const RuntimeInfo& runtime_info;
     const bool requires_coherent_global_memory;
     const bool requires_coherent_image_memory;
+    /// Set when HMMA lowers to cooperative matrices, which need the Vulkan memory model.
+    const bool vulkan_memory_model;
     Stage stage{};
 
     Id void_id{};
@@ -341,6 +363,8 @@ public:
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
+    Id barrier_vote_func{};
+    Id voted_barrier_func{};
     Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
@@ -354,18 +378,26 @@ public:
 
     Id write_storage_cas_loop_func{};
 
-    Id load_global_func_u32{};
-    Id load_global_func_u32x2{};
-    Id load_global_func_u32x4{};
-    Id write_global_func_u32{};
-    Id write_global_func_u32x2{};
-    Id write_global_func_u32x4{};
     // 32-bit global atomics on untracked addresses, routed to the storage buffer holding them.
     enum class GlobalAtomic : size_t {
         IAdd, SMin, UMin, SMax, UMax, Inc, Dec, And, Or, Xor, Exchange, AddF32, Count,
     };
-    std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
-    Id atomic_cas_global_func_u32{};
+    /// The functions that route global memory accesses among some of the bound storage buffers
+    struct GlobalMemoryFunctions {
+        Id load_u32{};
+        Id load_u32x2{};
+        Id load_u32x4{};
+        Id write_u32{};
+        Id write_u32x2{};
+        Id write_u32x4{};
+        std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> atomics{};
+        Id compare_exchange_u32{};
+    };
+    /// The first routes among every bound storage buffer, the others among
+    /// IR::Program::global_memory_routes
+    std::vector<GlobalMemoryFunctions> global_memory_functions;
+    std::unordered_map<const IR::Inst*, u32> global_memory_route;
+    [[nodiscard]] const GlobalMemoryFunctions& GlobalMemoryFunctionsOf(const IR::Inst& inst) const;
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -391,6 +423,9 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
@@ -430,6 +465,8 @@ public:
     Id mesh_task_offsets_buffer{};
     Id mesh_task_args_buffer{};
     Id mesh_group_index{};
+    /// NumWorkgroups of a native mesh program (Profile::has_broken_mesh_user_sgprs only).
+    Id mesh_num_workgroups{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -447,12 +484,28 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    /// Sirit deduplicates constants, but by hashing a freshly allocated copy of their words on
+    /// every call; immediates are emitted over and over, so remember the ids of scalar constants.
+    /// Keys are bit patterns, like Sirit's (0.0f and -0.0f, and NaN payloads, stay distinct).
+    template <typename T>
+    Id CachedConstant(::Common::unordered_map<u32, Id>& cache, Id type, T value) {
+        const auto [it, is_new]{cache.try_emplace(std::bit_cast<u32>(value))};
+        if (is_new) {
+            it->second = Constant(type, value);
+        }
+        return it->second;
+    }
+
+    ::Common::unordered_map<u32, Id> u32_constants;
+    ::Common::unordered_map<u32, Id> f32_constants;
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);
     void DefineLocalMemory(const IR::Program& program);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
+    void DefineBarrierVoteFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
     void DefineConstantBufferIndirectFunctions(const Info& info);
     void DefineStorageBuffers(const Info& info, u32& binding);

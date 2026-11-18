@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project SPDX-License-Identifier:
 # GPL-2.0-or-later
 
 if(DEFINED ENV{AZURECIREPO})
@@ -44,9 +43,13 @@ add_library(
     demangle.h
     device_power_state.cpp
     device_power_state.h
+    display_hdr.cpp
+    display_hdr.h
     div_ceil.h
     dkb_cpu_trace.cpp
     dkb_cpu_trace.h
+    jit_symbols.cpp
+    jit_symbols.h
     nx2_sampler.cpp
     nx2_sampler.h
     dynamic_library.cpp
@@ -71,6 +74,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    fs/profile_migration.cpp
+    fs/profile_migration.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -101,6 +106,8 @@ add_library(
     range_mutex.h
     range_sets.h
     range_sets.inc
+    recommended_settings.cpp
+    recommended_settings.h
     ring_buffer.h
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h
@@ -159,20 +166,32 @@ add_library(
     cpu_features.cpp
     cpu_features.h
     httplib.h
-    net/net.h net/net.cpp
+    net/ca_store.h net/net.h net/net.cpp
+    nextendo.cpp
+    nextendo.h
+    nextendo_game_catalog.cpp
+    nextendo_game_catalog.h
+    npln_patch_catalog.cpp
+    npln_patch_catalog.h
+    npln_patch_manifest.cpp
+    npln_patch_manifest.h
     container/unordered_map.h container/unordered_set.h)
 
 # The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64
 # PGO build returns errors for NSOs the plain build decodes (#95). -fno-profile-instr-use is the
 # spelling both clang and clang-cl accept; it overrides -fprofile-use from CMAKE_CXX_FLAGS.
+# -fno-profile-generate does the same for a training build: instrumented, the decoder reports
+# "Data corruption detected" for Ocarina of Time's main NSO and the game does not load.
 set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use;-fno-profile-generate>")
 
 if(WIN32)
-    target_sources(common PRIVATE windows/timer_resolution.cpp
+    target_sources(common PRIVATE windows/crash_handler.cpp
+        windows/crash_handler.h
+        windows/timer_resolution.cpp
         windows/timer_resolution.h)
-    target_link_libraries(common PRIVATE ntdll)
+    target_link_libraries(common PRIVATE dxgi ntdll)
 endif()
 
 if(NOT WIN32)
@@ -254,7 +273,7 @@ if (BOOST_NO_HEADERS)
 else()
     target_link_libraries(common PUBLIC Boost::headers)
 endif()
-target_link_libraries(common PRIVATE OpenSSL::SSL)
+target_link_libraries(common PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(common PUBLIC Boost::filesystem Boost::context httplib::httplib nlohmann_json::nlohmann_json)
 
 if (lz4_ADDED)

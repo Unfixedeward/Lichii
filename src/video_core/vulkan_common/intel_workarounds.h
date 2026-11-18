@@ -20,8 +20,10 @@ inline bool EnvFlag(const char* env_name, bool fallback) {
 /// integrated-GPU drivers, so they stay on for integrated GPUs and are off for discrete Arc GPUs,
 /// whose drivers handle the original behaviour. The environment variable overrides that choice:
 /// 1 turns the workaround on, 0 turns it off.
-///   EDEN_NX2_INTEL_STRIP_BARRIERS  removes barriers inside shader control flow
 ///   EDEN_NX2_INTEL_SKIP_OCCLUSION  draws instead of resolving occlusion-query comparisons
+/// EDEN_NX2_INTEL_STRIP_BARRIERS (vulkan_device.cpp) is on for every Intel Windows GPU: the
+/// shader recompiler then keeps uniform barriers and demotes or votes on divergent ones; 0 keeps
+/// every barrier in control flow.
 inline bool Enabled(const char* env_name, bool is_integrated) {
     return EnvFlag(env_name, is_integrated);
 }
