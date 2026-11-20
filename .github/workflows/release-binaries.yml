@@ -18,21 +18,8 @@ on:
   push:
     branches:
       - intel-arc
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # LICHII_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - "*.profdata"
-      - ".github/workflows/release-binaries.yml"
+    # No path filter on this fork: every push to intel-arc is a release, and GitHub doesn't run a
+    # path-filtered workflow when a push changes more than 300 files, as each upstream update does.
 
 permissions:
   contents: read
@@ -44,7 +31,7 @@ env:
   PGO_LLVM_VERSION: "23"
   # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
   # release notes. Update it when the branch moves to a newer upstream build.
-  UPSTREAM_BUILD: "341"
+  UPSTREAM_BUILD: "366"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
