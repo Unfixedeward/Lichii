@@ -15,6 +15,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/nx2_list_slots.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -37,7 +38,7 @@ public:
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_,
                     bool sparse_compatible_);
 
-    [[nodiscard]] VkBufferView View(u32 offset, u32 size, VideoCore::Surface::PixelFormat format);
+    [[nodiscard]] VkBufferView View(VkDeviceSize offset, VkDeviceSize size, VkFormat format);
 
     [[nodiscard]] VkBuffer Handle() const noexcept {
         return *buffer;
@@ -84,9 +85,9 @@ public:
 
 private:
     struct BufferView {
-        u32 offset;
-        u32 size;
-        VideoCore::Surface::PixelFormat format;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        VkFormat format;
         vk::BufferView handle;
     };
 
@@ -130,7 +131,11 @@ public:
         return vertex_repack_mask != 0;
     }
 
-    u64 CurrentTick();
+    /// Scheduler::CurrentTick, inline: the stream uniform reuse asks for it on every small
+    /// uniform buffer bind.
+    u64 CurrentTick() const noexcept {
+        return master_semaphore.CurrentTick();
+    }
 
     bool IsFree(u64 tick);
 
@@ -337,15 +342,7 @@ public:
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
-                           VideoCore::Surface::PixelFormat format) {
-        // An unmapped texture buffer has no format; its view is the null buffer's anyway.
-        if (format == VideoCore::Surface::PixelFormat::Invalid) {
-            format = VideoCore::Surface::PixelFormat::R8_UNORM;
-        }
-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
-                                              buffer.DeviceAddress(), offset, size,
-                                              TexelBufferFormat(format));
-    }
+                           VideoCore::Surface::PixelFormat format);
 
     bool ShouldLimitDynamicStorageBuffers() const {
         return limit_dynamic_storage_buffers;
@@ -367,8 +364,6 @@ private:
         }
     }
 
-    VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
-
     void ReserveNullBuffer();
     vk::Buffer CreateNullBuffer();
     VkDeviceSize NullBufferSize() const;
@@ -376,6 +371,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const MasterSemaphore& master_semaphore; ///< The scheduler's, for CurrentTick
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
 

@@ -170,7 +170,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     // emulator.
     , use_present_thread{Settings::values.async_presentation.GetValue() ||
                          Settings::values.frame_gen.GetValue()}
-    , present_wait{device.IsPresentWaitEnabled() && VideoCore::HostVsync::Enabled()}
+    , present_wait{device.IsPresentWaitEnabled()}
 {
     // No frame starter of an earlier boot is left for this presenter.
     VideoCore::HostVsync::Reset();

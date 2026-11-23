@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -18,7 +17,10 @@ namespace {
 struct Listener {
     const void* owner;
     std::function<void()> start;
+    // The display's last start, which the timer waits out, and the last start of either, which
+    // the FPS limit counts from.
     std::optional<Clock::time_point> last_start;
+    std::optional<Clock::time_point> last_signal;
     u32 rate{};
     bool active{};
 };
@@ -47,16 +49,8 @@ State& GetState() {
 
 } // Anonymous namespace
 
-bool Enabled() {
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_HOST_VSYNC");
-        return value == nullptr || value[0] != '0';
-    }();
-    return enabled;
-}
-
 bool Active() {
-    return Enabled() && GetState().active_listeners.load(std::memory_order_acquire) != 0;
+    return GetState().active_listeners.load(std::memory_order_acquire) != 0;
 }
 
 void AddListener(const void* owner, std::function<void()> start) {
@@ -88,6 +82,7 @@ void SetPacing(const void* owner, bool active, u32 rate) {
     listener->active = active;
     // The timer of a listener the display does not pace signals at once.
     listener->last_start.reset();
+    listener->last_signal.reset();
     state.CountActive();
 }
 
@@ -95,14 +90,17 @@ bool TimerTick(const void* owner, std::chrono::nanoseconds interval,
                const std::function<void()>& signal) {
     State& state = GetState();
     std::scoped_lock lock{state.mutex};
-    const Listener* const listener = state.Find(owner);
+    Listener* const listener = state.Find(owner);
+    const auto now = Clock::now();
     // Read under the lock StartFrame writes last_start under, after any start it made.
     if (listener != nullptr &&
-        !Service::TimerVsyncSignals(listener->last_start, listener->rate, Clock::now(),
-                                    interval)) {
+        !Service::TimerVsyncSignals(listener->last_start, listener->rate, now, interval)) {
         return false;
     }
     signal();
+    if (listener != nullptr) {
+        listener->last_signal = now;
+    }
     return true;
 }
 
@@ -115,7 +113,7 @@ std::optional<Clock::time_point> NextStart(Clock::time_point displayed) {
             continue;
         }
         const auto deadline =
-            Service::DisplayVsyncDeadline(listener.last_start, displayed, listener.rate);
+            Service::DisplayVsyncDeadline(listener.last_signal, displayed, listener.rate);
         next = next ? (std::max)(*next, deadline) : deadline;
     }
     return next;
@@ -128,6 +126,7 @@ void StartFrame() {
     for (Listener& listener : state.listeners) {
         if (listener.active) {
             listener.last_start = now;
+            listener.last_signal = now;
             listener.start();
         }
     }

@@ -14,6 +14,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 // TODO: find out which don't require stable iters
@@ -140,6 +141,8 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheTestAccess;
+
     /// Address shift for caching images into a hash table
     static constexpr u64 LICHII_PAGEBITS = 20;
 
@@ -537,8 +540,8 @@ private:
 
     void OnGPUASRegister(size_t map_id) final override;
 
-    /// Runs the Garbage Collector.
-    void RunGarbageCollector(bool out_of_memory);
+    /// Runs the Garbage Collector; at_critical collects as if usage were at the critical threshold.
+    void RunGarbageCollector(bool out_of_memory, bool at_critical);
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
@@ -550,21 +553,23 @@ private:
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
     void RefreshContents(Image& image, ImageId image_id);
+    void NoteHostOutOfMemory(std::string_view operation, const ImageBase& image);
 
     /// Upload data from guest to an image
     template <typename StagingBuffer>
     void UploadImageContents(Image& image, StagingBuffer& staging_buffer);
 
     /// Create a new image view from a guest descriptor
-    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config);
+    [[nodiscard]] ImageViewId CreateImageView(const TICEntry& config, bool& retry);
 
     /// Find or create an image from the given parameters
     [[nodiscard]] ImageId FindOrInsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                            RelaxedOptions options = RelaxedOptions{});
+                                            RelaxedOptions options = RelaxedOptions{},
+                                            bool* retry = nullptr);
 
     /// Find an image from the given parameters
     [[nodiscard]] ImageId FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
-                                    RelaxedOptions options);
+                                    RelaxedOptions options, bool* retry = nullptr);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
@@ -771,12 +776,15 @@ private:
     void NoteFlushed(const ImageBase& image, u64 tick);
     /// Fills `keep` with the bytes of the image's guest memory that landed write-backs and
     /// flushes with contents newer than `tick` hold (an asynchronous flush's snapshot leaves them).
-    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep);
+    /// Not those of `queued` write-backs, which have yet to land.
+    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep,
+                         std::span<const WritebackRanges::TickedRange> queued = {});
     /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
-    /// Collector write-backs waiting for the GPU (EDEN_NX2_GC_DOWNLOAD_ASYNC): written to guest
+    [[nodiscard]] bool GobViewBytesReady(DAddr cpu_addr, size_t size);
+    /// Collector write-backs waiting for the GPU: written to guest
     /// memory once their command buffer is done, except bytes the guest writes first; dropped if
     /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
     struct AsyncOverlapDownload {
@@ -796,6 +804,7 @@ private:
         u64 tick{};
         /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
         size_t address_space{};
+        bool gob_view{};
     };
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
     /// The GPU memory of an address space the cache has seen, or null.
@@ -825,7 +834,7 @@ private:
     std::unordered_map<DAddr, u64> overlap_writeback_ticks;
     /// The same write-backs by byte range, per page they touch (a few each, CapPageRecords):
     /// small targets share pages, and a page-wide skip dropped a neighbour's data with them
-    /// (black UI boxes, EDEN_NX2_GC_DOWNLOAD_KEEP_BYTES).
+    /// (black UI boxes).
     struct WritebackRange {
         DAddr begin;
         DAddr end;
@@ -941,6 +950,9 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    u64 host_oom_retry_frame{};
+    u64 host_oom_failures{};
+    std::chrono::steady_clock::time_point host_oom_log_time{};
     /// What the last CPU upload spent touching, reading and untiling guest memory, for
     /// EDEN_NX2_TC_TRACE.
     struct {

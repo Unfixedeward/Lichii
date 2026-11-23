@@ -7,6 +7,10 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
+      include_whats_new:
+        description: Include the staged What's New notes for this release
+        type: boolean
+        default: false
       nsight_aftermath:
         description: Build Windows with Nsight Aftermath GPU crash dumps (test builds only, no NVIDIA files shipped)
         type: boolean
@@ -14,21 +18,8 @@ on:
   push:
     branches:
       - intel-arc
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # LICHII_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - "*.profdata"
-      - ".github/workflows/release-binaries.yml"
+    # No path filter on this fork: every push to intel-arc is a release, and GitHub doesn't run a
+    # path-filtered workflow when a push changes more than 300 files, as each upstream update does.
 
 permissions:
   contents: read
@@ -40,7 +31,7 @@ env:
   PGO_LLVM_VERSION: "23"
   # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
   # release notes. Update it when the branch moves to a newer upstream build.
-  UPSTREAM_BUILD: "341"
+  UPSTREAM_BUILD: "366"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
@@ -96,6 +87,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       LICHII_BUILD_NUMBER: ${{ needs.prepare-release.outputs.number }}
+      LICHII_USE_PENDING_RELEASE_NOTES: ${{ inputs.publish_release && inputs.include_whats_new && 'ON' || 'OFF' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 3000M
       CCACHE_COMPILERCHECK: content
@@ -178,7 +170,7 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       - name: Install Qt on Linux ARM64
@@ -189,7 +181,7 @@ jobs:
           host: linux_arm64
           target: desktop
           arch: linux_gcc_arm64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # Ubuntu's own clang 18 cannot read a profile from a current LLVM, so take clang from the LLVM
@@ -237,7 +229,7 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # ccache does not handle MSVC-style command lines well, so the clang-cl job uses sccache. The
@@ -327,6 +319,7 @@ jobs:
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
             -DENABLE_UPDATE_CHECKER=ON
             -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }}
+            "-DLICHII_USE_PENDING_RELEASE_NOTES=$LICHII_USE_PENDING_RELEASE_NOTES"
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }}
             -DUSE_DISCORD_PRESENCE=OFF
             -DUSE_CCACHE=ON
@@ -375,6 +368,7 @@ jobs:
             -DLICHII_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }} \
+            "-DLICHII_USE_PENDING_RELEASE_NOTES=$LICHII_USE_PENDING_RELEASE_NOTES" \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -403,11 +397,12 @@ jobs:
             -DLICHII_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
             "-DCMAKE_PREFIX_PATH=$(brew --prefix qt@6);$(brew --prefix zlib)" \
-            "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
+            "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ needs.prepare-release.outputs.number }} \
+            "-DLICHII_USE_PENDING_RELEASE_NOTES=$LICHII_USE_PENDING_RELEASE_NOTES" \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON
@@ -593,6 +588,9 @@ jobs:
           app=build/release/bin/lichii.app
           test -x "$app/Contents/MacOS/lichii"
           test -x build/release/bin/eden-cli
+          cmp dist/nx2_switches.txt "$app/Contents/Resources/nx2_switches.txt"
+          test ! -e "$app/Contents/MacOS/nx2_switches.txt"
+          python3 tools/nx2/test_switches.py SwitchDiscovery.test_signed_macos_resources_and_precedence
           cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
           "$(brew --prefix qt@6)/bin/macdeployqt" "$app" \
             -executable="$app/Contents/MacOS/eden-cli" -libpath="$(brew --prefix)/lib" \

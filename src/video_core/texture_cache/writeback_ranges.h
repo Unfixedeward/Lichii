@@ -103,9 +103,10 @@ void KeepNewerBytes(Download& download, DAddr begin, DAddr end, u64 tick) {
 inline constexpr size_t PageRecords = 8;
 inline constexpr size_t MaxPageRecords = 32;
 
-/// Caps the write-back records (begin, end, tick) of the page [page_begin, page_end). Past
+/// Caps the write-back records (begin, end, tick, lost) of the page [page_begin, page_end). Past
 /// PageRecords, the oldest records whose bytes in the page records at least as new all hold go:
-/// those protect the bytes from older write-backs as well. Only past MaxPageRecords does the
+/// those protect the bytes from older write-backs as well. A lost record holds no landed bytes,
+/// so it does not stand in for a landed one (AppendNewerLanded). Only past MaxPageRecords does the
 /// oldest go regardless.
 template <typename Records>
 void CapPageRecords(Records& records, DAddr page_begin, DAddr page_end) {
@@ -116,8 +117,8 @@ void CapPageRecords(Records& records, DAddr page_begin, DAddr page_end) {
         boost::container::small_vector<std::pair<DAddr, DAddr>, 16> cover;
         for (size_t other = 0; other < records.size(); ++other) {
             const auto& range = records[other];
-            if (other != index && range.tick >= record.tick && range.begin < end &&
-                begin < range.end) {
+            if (other != index && range.tick >= record.tick && (record.lost || !range.lost) &&
+                range.begin < end && begin < range.end) {
                 cover.emplace_back((std::max)(range.begin, begin), (std::min)(range.end, end));
             }
         }

@@ -24,11 +24,15 @@ add_executable(tests
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
     video_core/hdr_output.cpp
+    video_core/host_vsync.cpp
     core/mii_model.cpp
+    core/address_space.cpp
     core/nx2_streamplay.cpp
     core/nx2_gpu_only_regions.cpp
     core/nx2_video_ready.cpp
     core/general_channel.cpp
+    core/home_menu.cpp
+    core/native_home_bootstrap.cpp
     core/kernel_finish_termination.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
@@ -102,11 +106,14 @@ add_executable(tests
     core/ncz_io_guards.cpp
     core/ncz_container.cpp
     core/file_sys_parsers.cpp
+    core/nca_header_authentication.cpp
+    core/system_data_view.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
+    video_core/texture_cache_gob_layout.cpp
     video_core/sampled_views.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
@@ -119,6 +126,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/descriptor_limits.cpp
+    video_core/device_buffer_pool.cpp
     video_core/device_memory_asid.cpp
     video_core/unbacked_fallback.cpp
     video_core/eviction_age.cpp
@@ -146,6 +154,7 @@ add_executable(tests
     video_core/multi_range_refresh.cpp
     video_core/command_fetch_order.cpp
     video_core/gpu_trace.cpp
+    video_core/nx2_render_follower.cpp
     video_core/gpu_written_pages.cpp
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
@@ -156,6 +165,7 @@ add_executable(tests
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
     hid_core/emulated_controller_config.cpp
+    hid_core/npad_assignment.cpp
     hid_core/sensor_info.cpp
     common/flat_allocator.cpp
     common/paged_scalar.cpp
@@ -182,6 +192,7 @@ add_executable(tests
     video_core/shader_cache_v2_driver.cpp
     video_core/vulkan_pipeline_binaries.cpp
     video_core/vulkan_buffer_oom.cpp
+    video_core/pipeline_layout_cache.cpp
     video_core/shader_precache.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
@@ -216,6 +227,7 @@ add_executable(tests
     common/fibers.cpp
     common/fs_iterate.cpp
     frontend_common/install_keys.cpp
+    frontend_common/play_time.cpp
     common/game_presets.cpp
     common/host_memory.cpp
     common/host_memory_failure.cpp
@@ -233,12 +245,12 @@ add_executable(tests
     common/scratch_buffer.cpp
     common/slot_vector.cpp
     common/sparse_large_vector.cpp
-    common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
     core/host_wait_margin.cpp
     core/local_redirect.cpp
+    core/nextendo_bcat.cpp
     core/nextendo_redirect.cpp
     core/filesystem_rename.cpp
     core/thread_startup_policy.cpp
@@ -260,6 +272,7 @@ add_executable(tests
     core/numeric_name_info.cpp
     core/numeric_name_info_ipc.cpp
     core/nifm_request.cpp
+    core/prepo_async_context.cpp
     core/cmif_out_buffer.cpp
     core/time_zone_fallback.cpp
     video_core/memory_tracker.cpp
@@ -271,6 +284,7 @@ add_executable(tests
     video_core/vp9_range_encoder.cpp
     video_core/nx2_gpu_mapping.cpp
     video_core/vertex_repack.cpp
+    video_core/vk_texel_buffer_range.cpp
     video_core/ampere_lowering.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -332,14 +346,57 @@ if (TARGET dynarmic::dynarmic)
 endif()
 
 target_compile_definitions(tests PRIVATE
-    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
+    LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures"
+    LICHII_TESTS_LOG_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-log")
 
 add_test(NAME tests COMMAND tests)
+
+if ((HAS_NCE AND LINUX) OR HAS_HYPERVISOR)
+    enable_language(ASM)
+    add_executable(arm_cpu_guest_tests core/arm_cpu_guest.cpp core/arm_cpu_guest.S)
+    target_link_libraries(arm_cpu_guest_tests PRIVATE core video_core frontend_common
+        ${PLATFORM_LIBRARIES})
+    target_compile_options(arm_cpu_guest_tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>)
+    if (HAS_HYPERVISOR)
+        set(native_backend hvf)
+        add_custom_command(TARGET arm_cpu_guest_tests POST_BUILD
+            COMMAND /usr/bin/codesign --force --sign -
+                --entitlements "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements"
+                "$<TARGET_FILE:arm_cpu_guest_tests>"
+            VERBATIM)
+        add_test(NAME arm_cpu_guest_hvf_execute_fault COMMAND arm_cpu_guest_tests hvf --execute-fault)
+        add_test(NAME arm_cpu_guest_hvf_revoke_fault COMMAND arm_cpu_guest_tests hvf --revoke-fault)
+        add_test(NAME arm_cpu_guest_hvf_relaunch COMMAND arm_cpu_guest_tests hvf --relaunch)
+        set_tests_properties(arm_cpu_guest_hvf_execute_fault arm_cpu_guest_hvf_revoke_fault
+            arm_cpu_guest_hvf_relaunch
+            PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+    else()
+        set(native_backend nce)
+    endif()
+    add_test(NAME arm_cpu_guest_${native_backend} COMMAND arm_cpu_guest_tests ${native_backend})
+    add_test(NAME arm_cpu_guest_${native_backend}_nx2_clock
+        COMMAND arm_cpu_guest_tests ${native_backend} --nx2-clock)
+    add_test(NAME arm_cpu_guest_dynarmic COMMAND arm_cpu_guest_tests dynarmic)
+    add_test(NAME arm_cpu_guest_${native_backend}_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --fault)
+    add_test(NAME arm_cpu_guest_${native_backend}_permission_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --permission-fault)
+    set_tests_properties(
+        arm_cpu_guest_${native_backend} arm_cpu_guest_${native_backend}_nx2_clock
+        arm_cpu_guest_dynarmic arm_cpu_guest_${native_backend}_fault
+        arm_cpu_guest_${native_backend}_permission_fault
+        PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+endif()
 
 add_executable(profile_migration_tests
     common/profile_migration.cpp)
 target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
+
+add_executable(ryujinx_save_link_tests common/ryujinx_save_link.cpp)
+target_link_libraries(ryujinx_save_link_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME ryujinx_save_link_tests COMMAND ryujinx_save_link_tests)
 
 add_executable(log_file_flush_tests
     common/log_file_flush.cpp)

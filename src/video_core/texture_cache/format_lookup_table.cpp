@@ -63,9 +63,9 @@ constexpr bool IsAstc(TextureFormat format) {
 
 } // Anonymous namespace
 
-PixelFormat PixelFormatFromTextureInfo(TextureFormat format, ComponentType red, ComponentType green,
-                                       ComponentType blue, ComponentType alpha,
-                                       bool is_srgb) noexcept {
+std::optional<PixelFormat> TryPixelFormatFromTextureInfo(TextureFormat format, ComponentType red,
+                                                         ComponentType green, ComponentType blue,
+                                                         ComponentType alpha, bool is_srgb) noexcept {
     if (IsAstc(format)) {
         // Some Switch 2 games leave ASTC component types unset or mixed (Ocarina of Time uses
         // {0 6 2 0} for sRGB ASTC 10x6). Matching them exactly fell through to A8B8G8R8 and
@@ -302,6 +302,16 @@ PixelFormat PixelFormatFromTextureInfo(TextureFormat format, ComponentType red, 
         return PixelFormat::ASTC_2D_6X5_UNORM;
     case Hash(TextureFormat::ASTC_2D_6X5, UNORM, SRGB):
         return PixelFormat::ASTC_2D_6X5_SRGB;
+    }
+    return std::nullopt;
+}
+
+PixelFormat PixelFormatFromTextureInfo(TextureFormat format, ComponentType red, ComponentType green,
+                                       ComponentType blue, ComponentType alpha,
+                                       bool is_srgb) noexcept {
+    if (const auto pixel_format =
+            TryPixelFormatFromTextureInfo(format, red, green, blue, alpha, is_srgb)) {
+        return *pixel_format;
     }
     UNIMPLEMENTED_MSG("texture format={} srgb={} components={{{} {} {} {}}}",
                       static_cast<int>(format), is_srgb, static_cast<int>(red),

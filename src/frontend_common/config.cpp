@@ -142,8 +142,15 @@ void Config::WriteToIni() const {
     CSimpleIniA::FileWriter writer(fp);
     // FileWriter ignores fputs errors, so the stream's error flag is checked too
     const bool written = config->Save(writer, false) >= 0 && !std::ferror(fp);
+    // On disk before the rename: without it a power loss or kernel panic right after a save can
+    // leave the renamed file empty (delayed allocation on ext4 and XFS).
+#ifdef _WIN32
+    const bool synced = written && std::fflush(fp) == 0 && _commit(_fileno(fp)) == 0;
+#else
+    const bool synced = written && std::fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+#endif
     const bool closed = std::fclose(fp) == 0;
-    if (!written || !closed) {
+    if (!synced || !closed) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
         std::filesystem::remove(temporary, error);
         return;
@@ -174,7 +181,21 @@ void Config::WriteToIni() const {
     if (error) {
         LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
         std::filesystem::remove(temporary, error);
+        return;
     }
+#ifndef _WIN32
+    // The rename is a change to the folder: it survives a power loss only once the folder is on
+    // disk too. The config is saved either way; a failure here only leaves that window open.
+    const auto folder =
+        target.has_parent_path() ? target.parent_path() : std::filesystem::path{"."};
+    const int folder_fd = open(folder.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (folder_fd < 0 || fsync(folder_fd) != 0) {
+        LOG_WARNING(Frontend, "Config file saved, but its folder could not be synced");
+    }
+    if (folder_fd >= 0) {
+        close(folder_fd);
+    }
+#endif
 }
 
 void Config::SetUpIni() {

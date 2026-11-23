@@ -31,7 +31,6 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
-#include "video_core/host_vsync.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
@@ -748,6 +747,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // off for newer AMD drivers below: checked after that, every AMD GPU looked like GCN4 and lost
     // VK_EXT_sampler_filter_minmax (an RDNA3 Radeon 780M logged it).
     const bool amd_gcn4_or_older = is_amd && !features.shader_float16_int8.shaderFloat16;
+    // CheezyEmu 132cc46c9e: Polaris by device ID, since newer AMD drivers report shaderFloat16 on
+    // Polaris and the float16 test above misses them. Polaris 10/11/20/21/30 (RX 470-590),
+    // Polaris 12 (RX 540/550) and the RX 580 2048SP. Only limits pipeline build threads.
+    {
+        const u32 device_id = properties.properties.deviceID;
+        const bool is_polaris = properties.properties.vendorID == 0x1002 &&
+                                ((device_id >= 0x67C0 && device_id <= 0x67FF) ||
+                                 (device_id >= 0x6980 && device_id <= 0x699F) ||
+                                 device_id == 0x6FDF);
+        is_amd_legacy_gcn = is_amd_driver && (is_polaris || amd_gcn4_or_older);
+    }
     const bool device_float16 = features.shader_float16_int8.shaderFloat16;
     if (is_amd_driver) {
         // AMD drivers need a higher amount of Sets per Pool in certain circumstances like in XC2.
@@ -1076,8 +1086,9 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
         .mixed_dot4_accelerated = properties.integer_dot_product
                                       .integerDotProduct4x8BitPackedMixedSignednessAccelerated !=
                                   VK_FALSE,
-        .descriptor_buffer = extensions.descriptor_buffer && extensions.buffer_device_address &&
-                             features.descriptor_indexing.runtimeDescriptorArray,
+        .descriptor_buffer = VideoCommon::HasFsr4PortDescriptorFeatures(
+            extensions.descriptor_buffer, features.buffer_device_address.bufferDeviceAddress,
+            features.descriptor_indexing.runtimeDescriptorArray),
         .synchronization2 = extensions.synchronization2,
         .compute_wave32 = extensions.subgroup_size_control &&
                           features.subgroup_size_control.computeFullSubgroups &&
@@ -1107,7 +1118,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::DeviceBuffers ? device_buffer_pool_block_size
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -1425,6 +1437,20 @@ bool Device::IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags want
     }
     const auto supported_usage = GetFormatFeatures(it->second, format_type);
     return (supported_usage & wanted_usage) == wanted_usage;
+}
+
+VkDeviceSize Device::GetTexelBufferOffsetAlignment(VkDeviceSize texel_alignment) const {
+    const auto& limits = properties.texel_buffer_alignment;
+    if (limits.sType == 0) {
+        return properties.properties.limits.minTexelBufferOffsetAlignment;
+    }
+    const auto effective = [texel_alignment](VkDeviceSize alignment, VkBool32 single_texel) {
+        return single_texel ? (std::min)(alignment, texel_alignment) : alignment;
+    };
+    return (std::max)(effective(limits.uniformTexelBufferOffsetAlignmentBytes,
+                                limits.uniformTexelBufferOffsetSingleTexelAlignment),
+                      effective(limits.storageTexelBufferOffsetAlignmentBytes,
+                                limits.storageTexelBufferOffsetSingleTexelAlignment));
 }
 
 std::string Device::GetDriverName() const {
@@ -1928,7 +1954,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // VK_KHR_present_id + VK_KHR_present_wait: the presenter learns when the display shows a
     // present. Each pair is asked for on its own and chained for device creation only when its
-    // extensions are enabled. Only host vsync uses them (EDEN_NX2_HOST_VSYNC=0: neither).
+    // extensions are enabled. Only host vsync uses them.
     const auto probe_present_wait = [this, &next](auto& id_features, auto& wait_features,
                                                   VkBool32& id, VkBool32& wait,
                                                   const char* id_name, const char* wait_name) {
@@ -1954,7 +1980,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
                  enabled ? "enabled" : "not supported by the device");
     };
     const bool wants_present_wait =
-        requires_swapchain && VideoCore::HostVsync::Enabled() &&
+        requires_swapchain &&
         loaded_extensions.contains(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (wants_present_wait && supported_extensions.contains(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
         supported_extensions.contains(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
@@ -1966,9 +1992,7 @@ bool Device::GetSuitability(bool requires_swapchain) {
     }
     // VK_KHR_present_id2 + VK_KHR_present_wait2: the same per surface, preferred where the
     // surface supports them. They need VK_KHR_get_surface_capabilities2 on the instance.
-    // EDEN_NX2_PRESENT_WAIT2=0 keeps to the first versions.
-    const char* const present_wait2_switch = std::getenv("EDEN_NX2_PRESENT_WAIT2");
-    if (wants_present_wait && (present_wait2_switch == nullptr || present_wait2_switch[0] != '0') &&
+    if (wants_present_wait &&
         dld.vkGetPhysicalDeviceSurfaceCapabilities2KHR != nullptr &&
         supported_extensions.contains(VK_KHR_PRESENT_ID_2_EXTENSION_NAME) &&
         supported_extensions.contains(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME)) {
@@ -2080,6 +2104,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
         SetNext(next, properties.subgroup_size_control);
+    }
+    if (instance_version >= VK_API_VERSION_1_3 ||
+        features.texel_buffer_alignment.texelBufferAlignment) {
+        properties.texel_buffer_alignment.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES;
+        SetNext(next, properties.texel_buffer_alignment);
     }
     if (extensions.transform_feedback) {
         properties.transform_feedback.sType =
@@ -2841,6 +2871,17 @@ void Device::CollectPhysicalMemoryInfo() {
         device_access_memory += heap_size;
     }
     main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
+    if ((mem_properties.memoryHeaps[main_heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+        const u64 main_heap_budget = limit(budget.heapBudget[main_heap]);
+        device_buffer_pool_block_size = SelectDeviceBufferPoolBlockSize(
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            main_heap_size, main_heap_budget);
+        if (device_buffer_pool_block_size != SeparatePoolBlockSize) {
+            LOG_INFO(Render_Vulkan, "Device buffer pool: {} MiB blocks (heap {} MiB, budget {} MiB)",
+                     device_buffer_pool_block_size >> 20, main_heap_size >> 20,
+                     main_heap_budget >> 20);
+        }
+    }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;

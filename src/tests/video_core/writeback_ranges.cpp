@@ -148,6 +148,7 @@ struct Record {
     DAddr begin;
     DAddr end;
     u64 tick;
+    bool lost = false;
 };
 
 bool HasRecord(const std::vector<Record>& records, DAddr begin, DAddr end, u64 tick) {
@@ -169,6 +170,27 @@ TEST_CASE("A page's write-back records keep the bytes only the oldest holds",
     CapPageRecords(records, page, page + 0x1000);
     CHECK(records.size() == PageRecords + 1);
     CHECK(HasRecord(records, 0x1000, 0x1100, 1));
+}
+
+TEST_CASE("A page's landed write-back record stays under newer lost ones",
+          "[video_core][texture_cache][writeback]") {
+    constexpr DAddr page = 0x1000;
+    // Two newer images dropped without a write-back cover the landed tick 10 between them; their
+    // data is gone, so guest memory still holds tick 10 there.
+    std::vector<Record> records{{0x1000, 0x1080, 10}, {0x1000, 0x1040, 11, true},
+                                {0x1040, 0x1080, 12, true}};
+    for (u64 index = 0; records.size() <= PageRecords; ++index) {
+        const DAddr begin = 0x1800 + index * 0x80;
+        records.push_back(Record{begin, begin + 0x80, index + 20});
+    }
+    CapPageRecords(records, page, page + 0x1000);
+    REQUIRE(HasRecord(records, 0x1000, 0x1080, 10));
+
+    // A download older than tick 10 leaves those bytes.
+    std::vector<Range> keep;
+    AppendNewerLanded(keep, records, 0x1000, 0x1100, 9, [](const Record&) { return false; });
+    MergeRanges(keep);
+    CHECK(keep == std::vector<Range>{{0x1000, 0x1080}});
 }
 
 TEST_CASE("A page's write-back records drop the oldest that newer ones hold all of",
@@ -229,6 +251,23 @@ TEST_CASE("A flush's snapshot is written whole without newer data over it",
                       [](const LandedRecord&) { return false; });
     MergeRanges(keep);
     CHECK(keep.empty());
+}
+
+TEST_CASE("An explicit download keeps earlier landed bytes with no pending write-backs",
+          "[video_core][texture_cache][writeback]") {
+    const std::vector<LandedRecord> records{{0x1200, 0x1400, 30, false}};
+    std::vector<TickedRange> landed;
+    std::vector<Range> keep;
+    AppendNewerLanded(keep, records, 0x1000, 0x2000, 20,
+                      [](const LandedRecord&) { return false; });
+    REQUIRE(Kept(landed, 20).empty());
+    CHECK(keep == std::vector<Range>{{0x1200, 0x1400}});
+
+    AppendLanded(landed, 0x1800, 0x100, 40, std::vector<Range>{}, TickedRanges{});
+    const auto just_landed = Kept(landed, 20);
+    keep.insert(keep.end(), just_landed.begin(), just_landed.end());
+    MergeRanges(keep);
+    CHECK(keep == std::vector<Range>{{0x1200, 0x1400}, {0x1800, 0x1900}});
 }
 
 TEST_CASE("A page's write-back records drop the oldest past the hard limit",
