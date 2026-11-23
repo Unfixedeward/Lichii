@@ -20,9 +20,8 @@ on:
       - intel-arc
     # No path filter on this fork: every push to intel-arc is a release, and GitHub doesn't run a
     # path-filtered workflow when a push changes more than 300 files, as each upstream update does.
-  # Refreshes nx2's compiler caches, which every branch's build restores (see docs/CI.md).
-  schedule:
-    - cron: "17 3 * * *"
+  # Upstream's nightly run refreshes nx2's caches; this fork has no nx2, and intel-arc saves its own
+  # caches on each release build instead (the refs/heads/intel-arc conditions below).
 
 permissions:
   contents: read
@@ -34,7 +33,7 @@ env:
   PGO_LLVM_VERSION: "23"
   # The upstream build (zortos293/Lichii tag build-N) the intel-arc branch is based on, for the
   # release notes. Update it when the branch moves to a newer upstream build.
-  UPSTREAM_BUILD: "366"
+  UPSTREAM_BUILD: "386"
 
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
@@ -239,7 +238,7 @@ jobs:
       # restore: only nx2 saves and keeps one entry per cache family (docs/CI.md).
       # A new snapshot is saved only when this run downloaded packages the cache lacked.
       - name: Drop superseded apt packages
-        if: startsWith(matrix.platform, 'linux-x86_64') && github.ref == 'refs/heads/nx2'
+        if: startsWith(matrix.platform, 'linux-x86_64') && github.ref == 'refs/heads/intel-arc'
         id: apt-trim
         shell: bash
         run: |
@@ -470,7 +469,7 @@ jobs:
             -DUSE_CCACHE=ON
 
       - name: Save CPM downloads
-        if: github.ref == 'refs/heads/nx2' && steps.cpm-cache.outputs.cache-hit != 'true'
+        if: github.ref == 'refs/heads/intel-arc' && steps.cpm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: .cache/cpm
@@ -494,7 +493,7 @@ jobs:
           du -sh .ccache .lto-cache 2> /dev/null || true
 
       - name: Save compiler objects
-        if: github.ref == 'refs/heads/nx2' && !cancelled() && steps.compiler-cache.outcome == 'success'
+        if: github.ref == 'refs/heads/intel-arc' && !cancelled() && steps.compiler-cache.outcome == 'success'
         uses: actions/cache/save@v5
         with:
           path: |
@@ -503,7 +502,7 @@ jobs:
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
       - name: Delete superseded caches
-        if: github.ref == 'refs/heads/nx2' && !cancelled()
+        if: github.ref == 'refs/heads/intel-arc' && !cancelled()
         continue-on-error: true
         shell: bash
         # The platform is spelled out rather than passed as PLATFORM: Windows variable names ignore
